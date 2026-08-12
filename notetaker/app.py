@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
 from typing import Any
+
+import numpy as np
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -40,7 +41,7 @@ def health() -> dict[str, Any]:
 
 @app.get("/api/notes")
 def notes(query: str = "", limit: int = 50) -> list[dict[str, Any]]:
-    return store.list(query, limit)
+    return store.search(query, limit)
 
 
 @app.get("/api/notes/{note_id}")
@@ -96,42 +97,56 @@ async def create_note(payload: dict[str, Any]) -> JSONResponse:
 @app.post("/api/query")
 async def query(payload: dict[str, Any]) -> dict[str, Any]:
     question = str(payload.get("question", payload.get("query", ""))).strip()
-    results = store.list(question, 10)
+    if not question:
+        return {"question": "", "answer": "Provide a concept, phrase, person, date, action, or timestamp to retrieve.", "evidence": []}
+    results = store.search(question, 20)
+    terms = [term.casefold() for term in question.split() if len(term) > 1 and ":" not in term]
     evidence = []
     for item in results:
         body = store.get(item["id"]) or {}
         for segment in body.get("transcript", []):
-            if not question or any(term.lower() in segment.get("text", "").lower() for term in question.split() if len(term) > 2):
-                evidence.append({"note_id": item["id"], "title": item["title"], "start": segment.get("start", 0), "end": segment.get("end", 0), "text": segment.get("text", ""), "confidence": segment.get("confidence", 0)})
-    return {"question": question, "answer": "Retrieved evidence only; no unsupported answer was generated.", "evidence": evidence[:50]}
+            text = str(segment.get("text", ""))
+            normalized = text.casefold()
+            if not terms or any(term in normalized for term in terms):
+                evidence.append({"note_id": item["id"], "title": item["title"], "start": segment.get("start", 0), "end": segment.get("end", 0), "text": text, "confidence": segment.get("confidence", 0), "speaker": segment.get("speaker", "Unknown speaker"), "source_segment_id": segment.get("id")})
+    return {"question": question, "answer": "Retrieved evidence only; no unsupported answer was generated.", "notes": results, "evidence": evidence[:50]}
 
 
 @app.websocket("/ws")
 async def stream(ws: WebSocket) -> None:
     await ws.accept()
     await ws.send_text(json.dumps({"t": "ready", "model": f"{config.model} + {config.draft_model}"}))
-    segmenter = await asyncio.to_thread(Segmenter)
+    segmenter = await asyncio.to_thread(Segmenter, config)
     session_segments: list[TranscriptSegment] = []
     context = ""
     elapsed = 0.0
     tasks: set[asyncio.Task[Any]] = set()
+    final_lock = asyncio.Lock()
 
     async def process(event_type: str, audio: Any, sid: int, offset: float) -> None:
         nonlocal context
-        final = event_type == "final"
-        decoded, language = await asyncio.to_thread(runtime.transcribe, audio, final, context, offset)
-        if not decoded:
-            return
-        text = " ".join(segment.text for segment in decoded)
-        if final:
-            session_segments.extend(decoded)
-            context = (context + " " + text)[-500:]
-            for segment in decoded:
-                await ws.send_text(json.dumps({"t": "segment", **segment.to_dict()}))
-            note = await asyncio.to_thread(pipeline.create_note, session_segments, "Live capture", "live", "live-session")
-            await ws.send_text(json.dumps({"t": "note", "title": note.title, "id": note.id, "language": language}))
-        else:
-            await ws.send_text(json.dumps({"t": "partial", "id": sid, "text": text, "language": language}))
+        try:
+            final = event_type == "final"
+            decoded, language = await asyncio.to_thread(runtime.transcribe, audio, final, context, offset)
+            if not decoded:
+                return
+            text = " ".join(segment.text for segment in decoded)
+            if final:
+                async with final_lock:
+                    session_segments.extend(decoded)
+                    session_segments.sort(key=lambda segment: (segment.start, segment.end, segment.id))
+                    context = " ".join(segment.text for segment in session_segments)[-config.context_chars:]
+                    for segment in decoded:
+                        await ws.send_text(json.dumps({"t": "segment", **segment.to_dict(), "partial": False}, ensure_ascii=False))
+                    note = await asyncio.to_thread(pipeline.create_note, session_segments, "Live capture", "live", "live-session", False)
+                    await ws.send_text(json.dumps({"t": "note", "title": note.title, "id": note.id, "language": language}))
+            else:
+                await ws.send_text(json.dumps({"t": "partial", "id": sid, "text": text, "language": language}, ensure_ascii=False))
+        except Exception as exc:
+            try:
+                await ws.send_text(json.dumps({"t": "error", "scope": event_type, "message": f"capture processing failed: {type(exc).__name__}"}))
+            except Exception:
+                pass
 
     try:
         while True:
@@ -140,7 +155,17 @@ async def stream(ws: WebSocket) -> None:
                 break
             events: list[tuple[str, Any, int]] = []
             if message.get("bytes") is not None:
-                pcm = __import__("numpy").frombuffer(message["bytes"], __import__("numpy").int16).astype(__import__("numpy").float32) / 32768.0
+                raw_audio = message["bytes"]
+                if not isinstance(raw_audio, (bytes, bytearray)) or not raw_audio or len(raw_audio) % 2:
+                    await ws.send_text(json.dumps({"t": "error", "scope": "audio", "message": "discarded malformed PCM frame"}))
+                    continue
+                if len(raw_audio) > 2_000_000:
+                    await ws.send_text(json.dumps({"t": "error", "scope": "audio", "message": "discarded oversized PCM frame"}))
+                    continue
+                pcm = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+                if not np.isfinite(pcm).all():
+                    await ws.send_text(json.dumps({"t": "error", "scope": "audio", "message": "discarded non-finite PCM frame"}))
+                    continue
                 elapsed += len(pcm) / 16000
                 events = await asyncio.to_thread(segmenter.feed, pcm)
                 await ws.send_text(json.dumps({"t": "level", "v": min(1.0, segmenter.level / 0.12), "on": segmenter.seg is not None, "lag": len(tasks)}))

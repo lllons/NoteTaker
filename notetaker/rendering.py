@@ -19,21 +19,29 @@ def _stamp(seconds: float) -> str:
 
 def render_markdown(note: KnowledgeNote) -> str:
     lines = [f"# {note.title}", "", f"> Source: `{note.source_type}` · Duration: `{_stamp(note.duration)}` · Language: `{note.language or 'auto'}`", ""]
-    lines += ["## Table of contents", "", "- [Executive summary](#executive-summary)", "- [Detailed notes](#detailed-notes)", "- [Reference transcript](#reference-transcript)", "- [Study notes](#study-notes)", "- [Knowledge graph](#knowledge-graph)", "- [Timeline](#timeline)", "- [Flashcards](#flashcards)", ""]
+    lines += ["## Table of contents", "", "- [Executive summary](#executive-summary)", "- [Semantic segments](#semantic-segments)", "- [Detailed notes](#detailed-notes)", "- [Reference transcript](#reference-transcript)", "- [Study notes](#study-notes)", "- [Action items](#action-items)", "- [Decisions](#decisions)", "- [Open questions](#open-questions)", "- [Knowledge graph](#knowledge-graph)", "- [Timeline](#timeline)", "- [Flashcards](#flashcards)", ""]
     lines += ["## Executive summary", ""] + [f"- {item}" for item in note.executive_summary] + [""]
-    lines += ["## Detailed notes", "", note.detailed_markdown or "_No structured notes extracted._", ""]
+    lines += ["## Semantic segments", ""]
+    for segment in note.semantic_segments:
+        title = segment.title or (segment.topics[0].title() if segment.topics else "Semantic segment")
+        lines.append(f"- **{title}** · `{_stamp(segment.start)}–{_stamp(segment.end)}` · confidence `{segment.confidence:.0%}` · {segment.speaker}")
+    lines += ["", "## Detailed notes", "", note.detailed_markdown or "_No structured notes extracted._", ""]
     lines += ["## Reference transcript", "", "<details><summary>Show near-verbatim transcript</summary>", ""]
     for segment in note.transcript:
         warning = " ⚠️ **low confidence**" if segment.confidence < 0.65 else ""
-        lines.append(f"> **{_stamp(segment.start)}–{_stamp(segment.end)} · {segment.speaker} · confidence {segment.confidence:.0%}**{warning}\n> {segment.text}")
+        lines.append(f"<a id=\"{segment.id}\"></a>\n> **{_stamp(segment.start)}–{_stamp(segment.end)} · {segment.speaker} · confidence {segment.confidence:.0%}**{warning}\n> {segment.text}")
     lines += ["", "</details>", ""]
     lines += ["## Study notes", ""] + [f"- {item}" for item in note.study_notes] + [""]
-    lines += ["## Action items and decisions", ""]
+    lines += ["## Action items", ""]
     for item in note.action_items:
-        lines.append(f"- [ ] {item.get('text', '')} _(source: {', '.join(item.get('source_segment_ids', []))})_")
+        lines.append(f"> [!todo]\n> {item.get('text', '')} _(source: {', '.join(item.get('source_segment_ids', []))})_\n")
+    lines += ["## Decisions", ""]
     for item in note.decisions:
-        lines.append(f"- **Decision:** {item.get('text', '')}")
-    lines += ["", "## Knowledge graph", "", "```json", json.dumps([edge for edge in note.graph], default=lambda o: o.__dict__, indent=2), "```", ""]
+        lines.append(f"> [!decision]\n> {item.get('text', '')} _(source: {', '.join(item.get('source_segment_ids', []))})_\n")
+    lines += ["## Open questions", ""]
+    for item in note.open_questions:
+        lines.append(f"> [!question]\n> {item.get('text', '')} _(source: {', '.join(item.get('source_segment_ids', []))})_\n")
+    lines += ["## Knowledge graph", "", "```json", json.dumps([edge for edge in note.graph], default=lambda o: o.__dict__, indent=2), "```", ""]
     lines += ["## Timeline", ""]
     for item in note.timeline:
         start = item.start if hasattr(item, "start") else item.get("start", 0)

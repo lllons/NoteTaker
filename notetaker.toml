@@ -8,6 +8,10 @@ threads = 0
 # Comma-separated names, jargon, code terms, or product names for Whisper prompting.
 hotwords = ""
 data_dir = "data"
+context_chars = 800
+max_segment_seconds = 20
+min_segment_seconds = 0.25
+provider_timeout = 45
 # labels-only preserves speaker fields without pretending heuristic labels are diarization.
 diarization = "labels-only"
 

@@ -8,6 +8,7 @@ those are kept separate from source-backed facts.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import Counter
 from typing import Any, Iterable
 
@@ -25,7 +26,12 @@ STOPWORDS = {
 
 URL_RE = re.compile(r"https?://[^\s)]+|www\.[^\s)]+")
 DATE_RE = re.compile(r"\b(?:\d{1,2}[/-])?\d{1,2}[/-]\d{2,4}\b|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:,\s+\d{4})?\b", re.I)
-NUMBER_RE = re.compile(r"\b\d+(?:[,.]\d+)?%?\b")
+NUMBER_RE = re.compile(r"\b\d+(?:[,.]\d+)?(?:%|\s?(?:ms|s|sec|seconds?|minutes?|hours?|kg|km|mb|gb|hz|khz|°c|°f))?\b", re.I)
+TECHNOLOGY_RE = re.compile(r"\b(?:Python|JavaScript|TypeScript|Rust|Go|Java|C\+\+|SQL|HTML|CSS|FastAPI|Django|React|Node(?:\.js)?|PostgreSQL|Postgres|SQLite|Redis|Docker|Kubernetes|Whisper|PyTorch|TensorFlow|NumPy|Numba|OpenAI|Anthropic|GitHub|REST|GraphQL|WebSocket|API|SDK|CLI|RAG|LLM)\b", re.I)
+LANGUAGE_RE = re.compile(r"\b(?:Python|JavaScript|TypeScript|Rust|Go|Java|C\+\+|C#|SQL|Swift|Kotlin|Ruby|PHP|R|MATLAB)\b", re.I)
+FILE_RE = re.compile(r"(?<!\w)(?:[~./\\\w-]+\.(?:py|js|ts|tsx|jsx|json|yaml|yml|toml|md|sql|csv|txt|ipynb)|/[~./\\\w-]+)(?!\w)", re.I)
+FUNCTION_RE = re.compile(r"\b(?:def|function|func|method|class)\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*\([^)]*\)")
+ALGORITHM_RE = re.compile(r"\b(?:algorithm|sort|search|descent|regression|clustering|classification|gradient|backpropagation|transformer|attention|recursion|dynamic programming|breadth[- ]first|depth[- ]first)\b", re.I)
 
 
 def _clean(text: str) -> str:
@@ -39,14 +45,36 @@ def _source_ids(segment: TranscriptSegment) -> list[str]:
     return [segment.id]
 
 
-def _topic_words(text: str, limit: int = 6) -> list[str]:
-    words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z0-9_+#.-]{2,}", text)]
+def _topic_words(text: str, limit: int = 8) -> list[str]:
+    words = [w.casefold() for w in re.findall(r"[A-Za-z][A-Za-z0-9_+#.-]{2,}", text)]
     counts = Counter(w for w in words if w not in STOPWORDS)
     return [word for word, _ in counts.most_common(limit)]
 
 
 def _sentences(text: str) -> list[str]:
-    return [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", text) if part.strip()]
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+|(?<=[;:])\s+|\n+", text) if part.strip()]
+
+
+def _unique(values: Iterable[Any]) -> list[Any]:
+    seen: set[str] = set()
+    result = []
+    for value in values:
+        fingerprint = unicodedata.normalize("NFKC", str(value)).casefold().strip()
+        if fingerprint and fingerprint not in seen:
+            seen.add(fingerprint)
+            result.append(value)
+    return result
+
+
+def _unique_dicts(values: Iterable[dict[str, Any]], keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for value in values:
+        fingerprint = "|".join(unicodedata.normalize("NFKC", str(value.get(key, ""))).casefold().strip() for key in keys)
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            result.append(value)
+    return result
 
 
 class HighFidelityExtractor:
@@ -70,7 +98,7 @@ class HighFidelityExtractor:
             right = set(incoming.topics)
             overlap = len(left & right) / max(1, len(left | right))
             pause = incoming.start - current.end
-            split = pause > 1.5 or (left and right and overlap == 0 and len(current.text) > 80)
+            split = current.speaker != incoming.speaker or pause > 1.5 or (left and right and overlap < 0.08 and len(current.text) > 80)
             if split:
                 blocks.append(current)
                 current = incoming
@@ -94,13 +122,15 @@ class HighFidelityExtractor:
                 block.title = (block.topics or ["Semantic segment"])[0].title()
         return blocks
 
-    def extract(self, segments: Iterable[TranscriptSegment]) -> dict[str, Any]:
+    def extract(self, segments: Iterable[TranscriptSegment], enrich: bool = True) -> dict[str, Any]:
         transcript = list(segments)
         for segment in transcript:
             segment.text = _clean(segment.text)
             segment.topics = _topic_words(segment.text)
 
         all_text = " ".join(segment.text for segment in transcript)
+        cited_transcript = "\n".join(f"[{segment.id} {segment.start:.2f}-{segment.end:.2f}s] {segment.text}" for segment in transcript)
+        semantic = self.semantic_segments(transcript)
         definitions = self._definitions(transcript)
         explanations = self._pattern_items(transcript, r"(?:because|therefore|so that|which means|in other words)", "explanation")
         examples = self._pattern_text(transcript, r"(?:for example|for instance|such as|e\.g\.)")
@@ -108,7 +138,7 @@ class HighFidelityExtractor:
         formulas = self._formulas(transcript)
         statistics = self._statistics(transcript)
         code_snippets = self._code(transcript)
-        action_items = self._pattern_items(transcript, r"(?:TODO|action item|need to|should|will|must|deadline|follow up|next step)", "action")
+        action_items = self._pattern_items(transcript, r"(?:TODO|action item|need to|should|will|must|deadline|follow up|next step|assigned to|owner)", "action")
         decisions = self._pattern_items(transcript, r"(?:decided|decision|agreed|we(?:'| wi)ll use|the plan is)", "decision")
         open_questions = self._questions(transcript)
         resources = self._resources(transcript)
@@ -120,8 +150,8 @@ class HighFidelityExtractor:
         ]
         graph = self._graph(transcript, concepts)
         timeline = [
-            {"start": s.start, "end": s.end, "label": s.topics[0] if s.topics else "Transcript segment", "detail": s.text, "segment_id": s.id}
-            for s in transcript
+            {"start": s.start, "end": s.end, "label": s.title or (s.topics[0] if s.topics else "Transcript segment"), "detail": s.text, "segment_id": s.id}
+            for s in semantic
         ]
         flashcards = self._flashcards(definitions, concepts, formulas, transcript)
         summary = self._summary(transcript, concepts, decisions, action_items)
@@ -136,10 +166,10 @@ class HighFidelityExtractor:
         }
         inferred_items: list[dict[str, Any]] = []
         provider_name = "local-deterministic"
-        if self.provider:
+        if self.provider and enrich:
             provider_name = self.provider.name
             try:
-                generated = self.provider.enrich(all_text, local_facts)
+                generated = self.provider.enrich(cited_transcript, local_facts)
                 inferred_items = self._provider_facts(generated, local_facts)
             except Exception as exc:
                 inferred_items = [{"text": f"Provider enrichment unavailable: {type(exc).__name__}", "label": "provider-error"}]
@@ -149,6 +179,7 @@ class HighFidelityExtractor:
             "executive_summary": summary,
             "reference_notes": [s.text for s in transcript],
             "study_notes": study,
+            "semantic_segments": semantic,
             "graph": graph,
             "timeline": timeline,
             "flashcards": flashcards,
@@ -157,34 +188,68 @@ class HighFidelityExtractor:
         }
 
     def render_detailed(self, note: Any) -> str:
+        stamps = {segment.id: f"{segment.start:.0f}s–{segment.end:.0f}s" for segment in note.transcript}
+
+        def evidence(item: dict[str, Any]) -> str:
+            ids = item.get("source_segment_ids", [])
+            refs = ", ".join(f"{segment_id} @ {stamps.get(segment_id, '?')}" for segment_id in ids)
+            return f" _Source: {refs}_" if refs else ""
+
         lines: list[str] = []
-        sections = [
-            ("Key concepts", note.concepts),
-            ("Definitions", [f"**{x['term']}** — {x['definition']}" for x in note.definitions]),
-            ("Explanations", [x["text"] for x in note.explanations]),
-            ("Examples", note.examples),
-            ("Analogies", note.analogies),
-            ("Formulas and numbers", [*note.formulas, *note.statistics]),
-            ("Code and commands", [f"```\n{x}\n```" for x in note.code_snippets]),
-            ("People, organizations, and products", [f"**{key}:** {', '.join(values)}" for key, values in note.entities.items() if values]),
-            ("Resources", [f"{x.get('kind', 'resource')}: {x.get('text', '')}" for x in note.resources]),
-            ("Open questions", [x["text"] for x in note.open_questions]),
-        ]
-        for title, items in sections:
-            if not items:
-                continue
-            lines += [f"### {title}", ""]
-            lines += [f"- {item}" for item in items]
+        if note.concepts:
+            lines += ["### Key concepts", "", " · ".join(f"`{concept}`" for concept in note.concepts), ""]
+        if note.definitions:
+            lines += ["### Definitions", ""]
+            for item in note.definitions:
+                lines += ["> [!definition]", f"> **{item['term']}** — {item['definition']}{evidence(item)}", ""]
+        for title, items in (("Explanations and reasoning", note.explanations), ("Examples", [{"text": value} for value in note.examples]), ("Analogies", [{"text": value} for value in note.analogies])):
+            if items:
+                lines += [f"### {title}", ""]
+                lines += [f"- {item.get('text', '')}{evidence(item)}" for item in items]
+                lines.append("")
+        if note.formulas or note.statistics:
+            lines += ["### Formulas, numbers, and measurements", "", "| Type | Source-backed statement |", "| --- | --- |"]
+            lines += [f"| Formula | {value} |" for value in note.formulas]
+            lines += [f"| Statistic | {value} |" for value in note.statistics]
+            lines.append("")
+        if note.code_snippets:
+            lines += ["### Code, commands, and file paths", ""]
+            for snippet in note.code_snippets:
+                lines += ["```text", snippet, "```", ""]
+        if note.entities:
+            populated = [(key.replace("_", " ").title(), values) for key, values in note.entities.items() if values]
+            if populated:
+                lines += ["### Named entities and technical vocabulary", "", "| Category | Mentions |", "| --- | --- |"]
+                lines += [f"| {key} | {', '.join(values)} |" for key, values in populated]
+                lines.append("")
+        if note.action_items:
+            lines += ["### Action items", ""]
+            lines += [f"> [!todo]\n> {item['text']}{evidence(item)}\n" for item in note.action_items]
+        if note.decisions:
+            lines += ["### Decisions", ""]
+            lines += [f"> [!decision]\n> {item['text']}{evidence(item)}\n" for item in note.decisions]
+        if note.open_questions:
+            lines += ["### Open questions", ""]
+            lines += [f"> [!question]\n> {item['text']}{evidence(item)}\n" for item in note.open_questions]
+        if note.resources:
+            lines += ["### Resources mentioned", ""]
+            lines += [f"- **{item.get('kind', 'resource')}**: {item.get('text', '')}{evidence(item)}" for item in note.resources]
             lines.append("")
         return "\n".join(lines).strip()
 
     def _definitions(self, segments: list[TranscriptSegment]) -> list[dict[str, Any]]:
         result = []
-        pattern = re.compile(r"\b([A-Za-z][\w -]{1,50}?)\s+(?:is|means|refers to|is defined as)\s+([^.!?]{8,240})", re.I)
+        pattern = re.compile(r"\b([A-Za-z][\w+#. -]{1,50}?)\s+(?:is|means|refers to|is defined as)\s+([^.!?]{8,300})", re.I)
+        colon_pattern = re.compile(r"\b([A-Za-z][\w+#. -]{1,50})\s*:\s*([^.!?]{8,300})")
         for segment in segments:
-            for match in pattern.finditer(segment.text):
-                result.append({"term": match.group(1).strip(), "definition": match.group(2).strip(), "source_segment_ids": _source_ids(segment)})
-        return result
+            for sentence in _sentences(segment.text):
+                for candidate in (pattern, colon_pattern):
+                    for match in candidate.finditer(sentence):
+                        term = match.group(1).strip(" ,;:-")
+                        definition = match.group(2).strip()
+                        if term and definition and len(term.split()) <= 8:
+                            result.append({"term": term, "definition": definition, "source_segment_ids": _source_ids(segment), "confidence": segment.confidence})
+        return _unique_dicts(result, ("term", "definition"))
 
     def _pattern_items(self, segments: list[TranscriptSegment], marker: str, kind: str) -> list[dict[str, Any]]:
         result = []
@@ -193,10 +258,10 @@ class HighFidelityExtractor:
             for sentence in _sentences(segment.text):
                 if pattern.search(sentence):
                     result.append({"text": sentence, "kind": kind, "source_segment_ids": _source_ids(segment), "confidence": segment.confidence})
-        return result
+        return _unique_dicts(result, ("text", "kind"))
 
     def _pattern_text(self, segments: list[TranscriptSegment], marker: str) -> list[str]:
-        return [item["text"] for item in self._pattern_items(segments, marker, "source-backed")]
+        return _unique(item["text"] for item in self._pattern_items(segments, marker, "source-backed"))
 
     def _formulas(self, segments: list[TranscriptSegment]) -> list[str]:
         result = []
@@ -204,7 +269,7 @@ class HighFidelityExtractor:
             for sentence in _sentences(segment.text):
                 if re.search(r"(?:\b[A-Za-z]\w*\s*[=<>]|\b(?:plus|minus|times|divided by)\b|∑|∫|→|=>)", sentence):
                     result.append(sentence)
-        return result
+        return _unique(result)
 
     def _statistics(self, segments: list[TranscriptSegment]) -> list[str]:
         result = []
@@ -212,7 +277,7 @@ class HighFidelityExtractor:
             for sentence in _sentences(segment.text):
                 if NUMBER_RE.search(sentence) or re.search(r"\b(?:percent|million|billion|average|median|probability|rate)\b", sentence, re.I):
                     result.append(sentence)
-        return result
+        return _unique(result)
 
     def _code(self, segments: list[TranscriptSegment]) -> list[str]:
         result = []
@@ -220,7 +285,7 @@ class HighFidelityExtractor:
             fenced = re.findall(r"```(?:\w+)?\s*(.*?)```", segment.text, re.S)
             result.extend(fenced)
             for sentence in _sentences(segment.text):
-                if re.search(r"(?:^|\s)(?:pip|npm|bun|git|docker|python|curl)\s+[-\w]|[\w./-]+\.(?:py|js|ts|json|toml|yaml)\b", sentence, re.I):
+                if re.search(r"(?:^|\s)(?:pip|npm|bun|git|docker|python|curl|make|kubectl|uv)\s+[-\w]|[\w./~-]+\.(?:py|js|ts|tsx|jsx|json|toml|yaml|yml|sql)\b|(?:--?[A-Za-z][\w-]*)", sentence, re.I):
                     result.append(sentence)
         return list(dict.fromkeys(x.strip() for x in result if x.strip()))
 
@@ -243,17 +308,32 @@ class HighFidelityExtractor:
         return result
 
     def _concepts(self, segments: list[TranscriptSegment], definitions: list[dict[str, Any]]) -> list[str]:
-        terms = [item["term"].strip().lower() for item in definitions]
+        terms = [re.sub(r"^(?:an?|the)\s+", "", item["term"].strip().casefold()) for item in definitions]
         for segment in segments:
             terms.extend(segment.topics)
-        return list(dict.fromkeys(term for term in terms if len(term) > 2))[:40]
+        return _unique(term for term in terms if len(term) > 2)[:60]
 
     def _entities(self, text: str) -> dict[str, list[str]]:
-        proper = re.findall(r"\b[A-Z][A-Za-z0-9-]{2,}(?:\s+[A-Z][A-Za-z0-9-]{2,})*\b", text)
-        organizations = [x for x in proper if re.search(r"\b(?:Inc|Corp|Company|University|Institute|Labs?|Org)\b", x)]
-        people = [x for x in proper if x not in organizations and len(x.split()) <= 3]
+        proper = re.findall(r"\b[A-Z][A-Za-z0-9+#.-]{2,}(?:\s+[A-Z][A-Za-z0-9+#.-]{2,})*\b", text)
+        organizations = [x for x in proper if re.search(r"\b(?:Inc|Corp|Company|University|Institute|Labs?|Org|Foundation|Team)\b", x)]
+        locations = re.findall(r"\b(?:in|at|from|near)\s+([A-Z][A-Za-z-]+(?:\s+[A-Z][A-Za-z-]+)?)", text)
+        technologies = TECHNOLOGY_RE.findall(text)
+        languages = LANGUAGE_RE.findall(text)
+        files = FILE_RE.findall(text)
+        functions = [match[0] or match[1] for match in FUNCTION_RE.findall(text)]
+        algorithms = ALGORITHM_RE.findall(text)
         dates = DATE_RE.findall(text)
-        return {"people_or_proper_nouns": list(dict.fromkeys(people))[:40], "organizations": list(dict.fromkeys(organizations))[:40], "dates": list(dict.fromkeys(dates))[:40]}
+        deadlines = re.findall(r"(?:deadline|due|by|before|on)\s+([^.!?,;]{2,60})", text, re.I)
+        products = [x for x in proper if x not in organizations and x in technologies]
+        people = [x for x in proper if x not in organizations and x not in products and len(x.split()) <= 3]
+        return {
+            "people": _unique(people)[:40], "organizations": _unique(organizations)[:40],
+            "products": _unique(products)[:40], "locations": _unique(locations)[:40],
+            "dates": _unique(dates)[:40], "deadlines": _unique(deadlines)[:40],
+            "technologies": _unique(technologies)[:60], "programming_languages": _unique(languages)[:30],
+            "files": _unique(files)[:50], "functions": _unique(functions)[:50],
+            "algorithms": _unique(algorithms)[:40], "mathematical_expressions": _unique(NUMBER_RE.findall(text))[:60],
+        }
 
     def _graph(self, segments: list[TranscriptSegment], concepts: list[str]) -> list[GraphEdge]:
         edges: list[GraphEdge] = []

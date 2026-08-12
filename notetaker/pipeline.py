@@ -24,14 +24,14 @@ class KnowledgePipeline:
         title: str | None = None,
         source_type: str = "live",
         note_id: str | None = None,
+        enrich: bool | None = None,
     ) -> KnowledgeNote:
         transcript = list(segments)
         if not transcript:
             raise ValueError("At least one transcript segment is required")
         raw = " ".join(segment.text for segment in transcript)
         stable_id = note_id or hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-        extracted = self.extractor.extract(transcript)
-        semantic_segments = self.extractor.semantic_segments(transcript)
+        extracted = self.extractor.extract(transcript, enrich=source_type != "live" if enrich is None else enrich)
         note = KnowledgeNote(
             id=stable_id,
             title=title or self._title(raw),
@@ -40,7 +40,6 @@ class KnowledgePipeline:
             language=next((s.language for s in transcript if s.language), None),
             duration=max(s.end for s in transcript),
             transcript=transcript,
-            semantic_segments=semantic_segments,
             **extracted,
         )
         note.detailed_markdown = self.extractor.render_detailed(note)

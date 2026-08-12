@@ -26,6 +26,10 @@ class AppConfig:
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str = ""
+    context_chars: int = 800
+    max_segment_seconds: int = 20
+    min_segment_seconds: float = 0.25
+    provider_timeout: int = 45
 
     @classmethod
     def from_sources(cls, config_path: str | Path = "notetaker.toml") -> "AppConfig":
@@ -53,4 +57,8 @@ class AppConfig:
             llm_base_url=value("llm_base_url", "NOTE_TAKER_LLM_BASE_URL", None) or None,
             llm_api_key=value("llm_api_key", "NOTE_TAKER_LLM_API_KEY", None) or None,
             llm_model=str(value("llm_model", "NOTE_TAKER_LLM_MODEL", "")),
+            context_chars=max(200, int(value("context_chars", "NOTE_TAKER_CONTEXT_CHARS", cls.context_chars))),
+            max_segment_seconds=max(5, int(value("max_segment_seconds", "NOTE_TAKER_MAX_SEGMENT_SECONDS", cls.max_segment_seconds))),
+            min_segment_seconds=max(0.1, float(value("min_segment_seconds", "NOTE_TAKER_MIN_SEGMENT_SECONDS", cls.min_segment_seconds))),
+            provider_timeout=max(5, int(value("provider_timeout", "NOTE_TAKER_PROVIDER_TIMEOUT", cls.provider_timeout))),
         )
