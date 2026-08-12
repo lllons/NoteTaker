@@ -1,0 +1,16 @@
+[notetaker]
+# Use large-v3-turbo when the machine can sustain it; small.en is a practical CPU default.
+model = "small.en"
+draft_model = "base.en"
+language = "auto"
+beam_size = 5
+threads = 0
+# Comma-separated names, jargon, code terms, or product names for Whisper prompting.
+hotwords = ""
+data_dir = "data"
+# labels-only preserves speaker fields without pretending heuristic labels are diarization.
+diarization = "labels-only"
+
+# Optional OpenAI-compatible enrichment provider. Leave blank for local deterministic mode.
+# llm_base_url = "https://your-provider.example/v1"
+# llm_model = "your-json-capable-model"
