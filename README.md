@@ -68,7 +68,7 @@ python NoteTaker.py --host 0.0.0.0 --port 8000
 
 Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser. If the app is running in a hosted preview or container, use the preview URL supplied by that environment rather than replacing `0.0.0.0` with a public address.
 
-The first transcription can take longer because the configured Whisper models are loaded and downloaded. Once the page opens:
+The first capture can take longer because the configured Whisper models are loaded and downloaded when capture starts. Once the page opens:
 
 1. Press **Start capture**.
 2. Allow microphone access when the browser asks.
@@ -376,7 +376,7 @@ Allow the site in the browser's microphone permissions. On macOS, also enable th
 
 ### The first run is slow or appears idle
 
-Model downloads and initialization can take time. Check the terminal output, confirm network access, and start with `small.en` or `base.en` before switching to `large-v3-turbo`.
+The server prints its local URL immediately, then model downloads and initialization begin when you press **Start capture**. Check the model status shown in the page and the terminal output, confirm network access, and start with `small.en` or `base.en` before switching to `large-v3-turbo`.
 
 ### Transcription quality is poor
 

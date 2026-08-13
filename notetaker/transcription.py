@@ -32,6 +32,31 @@ MIN_SEG = int(0.25 * SR)
 PARTIAL_EVERY = SR
 HALLUCINATIONS = {"you", "thank you", "thanks for watching", "bye", "okay", "oh", "hmm", "um"}
 
+
+def resample_audio(audio: np.ndarray, source_rate: float, target_rate: int = SR) -> np.ndarray:
+    """Convert browser PCM to the 16 kHz stream rate required by Silero VAD.
+
+    Browsers may ignore the requested AudioContext sample rate and provide
+    44.1/48 kHz audio instead. Keeping this guard on the server prevents those
+    devices from feeding an invalid frame size or a three-times-slow signal to
+    the VAD and Whisper models.
+    """
+    values = np.asarray(audio, dtype=np.float32).reshape(-1)
+    try:
+        rate = float(source_rate)
+    except (TypeError, ValueError):
+        rate = float(target_rate)
+    if not len(values) or not np.isfinite(rate) or rate <= 0 or abs(rate - target_rate) < 0.5:
+        return values
+    if not np.isfinite(values).all():
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    output_length = max(1, int(round(len(values) * target_rate / rate)))
+    if len(values) == 1:
+        return np.repeat(values, output_length).astype(np.float32, copy=False)
+    positions = np.linspace(0.0, len(values) - 1, output_length, dtype=np.float32)
+    return np.interp(positions, np.arange(len(values), dtype=np.float32), values).astype(np.float32, copy=False)
+
+
 MODELS = {
     "tiny.en": "Systran/faster-whisper-tiny.en",
     "base.en": "Systran/faster-whisper-base.en",
@@ -74,6 +99,8 @@ class TranscriptionRuntime:
         self.final: ModelBundle | None = None
         self.draft: ModelBundle | None = None
         self._load_lock = threading.Lock()
+        self._model_state = "not-loaded"
+        self._model_error: str | None = None
         self.speakers = SpeakerLabeler(config.diarization)
 
     def _load(self, name: str) -> ModelBundle:
@@ -81,12 +108,48 @@ class TranscriptionRuntime:
         model = WhisperModel(repo, device="cpu", compute_type="int8", cpu_threads=self.config.threads)
         return ModelBundle(model, threading.Lock(), ThreadPoolExecutor(max_workers=1))
 
+    def status(self) -> dict[str, Any]:
+        """Report configured and loaded models without exposing model internals.
+
+        A loaded faster-whisper model has completed its local cache lookup and
+        weight loading, so ``ready`` is the useful confirmation that the model
+        download/load step succeeded. The capture websocket warms the models
+        before it begins processing audio, while importing the application stays
+        lightweight.
+        """
+        with self._load_lock:
+            loaded: list[str] = []
+            if self.final is not None:
+                loaded.append(self.config.model)
+            if self.draft is not None and self.config.draft_model != self.config.model:
+                loaded.append(self.config.draft_model)
+            return {
+                "state": self._model_state,
+                "configured": {
+                    "final": self.config.model,
+                    "draft": self.config.draft_model,
+                },
+                "loaded": loaded,
+                "error": self._model_error,
+            }
+
     def ensure_loaded(self) -> None:
         with self._load_lock:
-            if self.final is None:
-                self.final = self._load(self.config.model)
-            if self.draft is None:
-                self.draft = self.final if self.config.draft_model == self.config.model else self._load(self.config.draft_model)
+            if self.final is not None and self.draft is not None:
+                self._model_state = "ready"
+                return
+            self._model_state = "loading"
+            self._model_error = None
+            try:
+                if self.final is None:
+                    self.final = self._load(self.config.model)
+                if self.draft is None:
+                    self.draft = self.final if self.config.draft_model == self.config.model else self._load(self.config.draft_model)
+                self._model_state = "ready"
+            except Exception as exc:
+                self._model_state = "error"
+                self._model_error = type(exc).__name__
+                raise
 
     def transcribe(self, audio: np.ndarray, final: bool, context: str = "", offset: float = 0.0) -> tuple[list[TranscriptSegment], str | None]:
         self.ensure_loaded()

@@ -31,7 +31,13 @@ def main() -> None:
     import uvicorn
     from notetaker.app import app
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    display_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
+    print(f"NoteTaker listening at http://{display_host}:{args.port}", flush=True)
+    print(
+        f"Whisper models: {args.model} + {args.draft}. They download when capture starts and are cached locally.",
+        flush=True,
+    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

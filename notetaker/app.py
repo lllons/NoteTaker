@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from typing import Any
 
 import numpy as np
@@ -17,7 +18,7 @@ from .pipeline import KnowledgePipeline
 from .provider import provider_from_config
 from .rendering import render
 from .storage import KnowledgeStore
-from .transcription import Segmenter, TranscriptionRuntime
+from .transcription import SR, Segmenter, TranscriptionRuntime, resample_audio
 from .web import PAGE
 
 
@@ -36,7 +37,13 @@ def index() -> str:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "service": "notetaker", "provider": provider.name if provider else "local-deterministic", "model": config.model}
+    return {
+        "ok": True,
+        "service": "notetaker",
+        "provider": provider.name if provider else "local-deterministic",
+        "model": config.model,
+        "models": runtime.status(),
+    }
 
 
 @app.get("/api/notes")
@@ -115,11 +122,16 @@ async def query(payload: dict[str, Any]) -> dict[str, Any]:
 @app.websocket("/ws")
 async def stream(ws: WebSocket) -> None:
     await ws.accept()
-    await ws.send_text(json.dumps({"t": "ready", "model": f"{config.model} + {config.draft_model}"}))
-    segmenter = await asyncio.to_thread(Segmenter, config)
+    await ws.send_text(json.dumps({
+        "t": "ready",
+        "model": f"{config.model} + {config.draft_model}",
+        "model_status": runtime.status(),
+    }))
+    segmenter: Segmenter | None = None
     session_segments: list[TranscriptSegment] = []
     context = ""
     elapsed = 0.0
+    source_sample_rate = float(SR)
     tasks: set[asyncio.Task[Any]] = set()
     final_lock = asyncio.Lock()
 
@@ -127,7 +139,10 @@ async def stream(ws: WebSocket) -> None:
         nonlocal context
         try:
             final = event_type == "final"
+            current_status = runtime.status()
+            await ws.send_text(json.dumps({"t": "model", **current_status, "state": "loading" if current_status["state"] == "not-loaded" else current_status["state"]}))
             decoded, language = await asyncio.to_thread(runtime.transcribe, audio, final, context, offset)
+            await ws.send_text(json.dumps({"t": "model", **runtime.status()}))
             if not decoded:
                 return
             text = " ".join(segment.text for segment in decoded)
@@ -141,14 +156,35 @@ async def stream(ws: WebSocket) -> None:
                     note = await asyncio.to_thread(pipeline.create_note, session_segments, "Live capture", "live", "live-session", False)
                     await ws.send_text(json.dumps({"t": "note", "title": note.title, "id": note.id, "language": language}))
             else:
-                await ws.send_text(json.dumps({"t": "partial", "id": sid, "text": text, "language": language}, ensure_ascii=False))
+                await ws.send_text(json.dumps({"t": "partial", "id": sid, "start": offset, "end": offset + len(audio) / SR, "text": text, "language": language}, ensure_ascii=False))
         except Exception as exc:
             try:
-                await ws.send_text(json.dumps({"t": "error", "scope": event_type, "message": f"capture processing failed: {type(exc).__name__}"}))
+                await ws.send_text(json.dumps({
+                    "t": "error",
+                    "scope": event_type,
+                    "message": f"capture processing failed: {type(exc).__name__}: {str(exc)[:240]}",
+                    "models": runtime.status(),
+                }))
             except Exception:
                 pass
 
     try:
+        segmenter = await asyncio.to_thread(Segmenter, config)
+        await ws.send_text(json.dumps({"t": "vad", "state": "ready", "sample_rate": SR}))
+        # Warm the Whisper models as soon as capture starts so the user gets
+        # visible progress and the first spoken segment is not the trigger for
+        # an otherwise silent download.
+        await ws.send_text(json.dumps({"t": "model", **runtime.status(), "state": "loading"}))
+        try:
+            await asyncio.to_thread(runtime.ensure_loaded)
+            await ws.send_text(json.dumps({"t": "model", **runtime.status()}))
+        except Exception as exc:
+            await ws.send_text(json.dumps({
+                "t": "error",
+                "scope": "model",
+                "message": f"model loading failed: {type(exc).__name__}: {str(exc)[:240]}",
+                "models": runtime.status(),
+            }))
         while True:
             message = await ws.receive()
             if message["type"] == "websocket.disconnect":
@@ -166,22 +202,43 @@ async def stream(ws: WebSocket) -> None:
                 if not np.isfinite(pcm).all():
                     await ws.send_text(json.dumps({"t": "error", "scope": "audio", "message": "discarded non-finite PCM frame"}))
                     continue
-                elapsed += len(pcm) / 16000
+                pcm = resample_audio(pcm, source_sample_rate, SR)
+                if not len(pcm):
+                    continue
+                elapsed += len(pcm) / SR
                 events = await asyncio.to_thread(segmenter.feed, pcm)
-                await ws.send_text(json.dumps({"t": "level", "v": min(1.0, segmenter.level / 0.12), "on": segmenter.seg is not None, "lag": len(tasks)}))
+                await ws.send_text(json.dumps({"t": "level", "v": min(1.0, segmenter.level / 0.12), "on": segmenter.seg is not None, "lag": len(tasks), "sample_rate": source_sample_rate}))
             elif message.get("text"):
                 try:
-                    if json.loads(message["text"]).get("t") == "flush":
+                    payload = json.loads(message["text"])
+                    event_name = payload.get("t")
+                    if event_name == "config":
+                        requested_rate = float(payload.get("sample_rate", SR))
+                        if not math.isfinite(requested_rate) or not 8000 <= requested_rate <= 192000:
+                            await ws.send_text(json.dumps({"t": "error", "scope": "audio", "message": "unsupported browser sample rate"}))
+                            continue
+                        source_sample_rate = requested_rate
+                        await ws.send_text(json.dumps({"t": "audio-config", "source_rate": source_sample_rate, "target_rate": SR}))
+                    elif event_name == "flush":
                         events = await asyncio.to_thread(segmenter.flush)
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    await ws.send_text(json.dumps({"t": "error", "scope": "stream", "message": "ignored malformed control message"}))
                     continue
             for event_type, audio, sid in events:
-                task = asyncio.create_task(process(event_type, audio, sid, max(0.0, elapsed - len(audio) / 16000)))
+                task = asyncio.create_task(process(event_type, audio, sid, max(0.0, elapsed - len(audio) / SR)))
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
-    except Exception:
+    except Exception as exc:
         # Disconnects and browser microphone shutdowns are normal session endings.
-        pass
+        try:
+            await ws.send_text(json.dumps({
+                "t": "error",
+                "scope": "stream",
+                "message": f"capture session failed: {type(exc).__name__}: {str(exc)[:240]}",
+                "models": runtime.status(),
+            }))
+        except Exception:
+            pass
     finally:
         for task in tasks:
             task.cancel()
