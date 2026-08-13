@@ -36,17 +36,26 @@ The checked-in default is the full `large-v3` Whisper model for both final and p
 WhisperModel(repo, device="cpu", compute_type="int8", cpu_threads=threads)
 ```
 
-There is no GPU requirement or GPU fallback. `draft_model = "large-v3"` deliberately reuses the same loaded bundle, avoiding a second large model in memory. Partial updates use a smaller beam than final updates, but the final utterance uses the configured beam size (`8` by default).
+There is no GPU requirement or GPU fallback. The web page exposes five selectable CPU profiles. Model 1 is the existing `large-v3` behavior; Models 2–5 keep the same largest standard Whisper checkpoint but increase final beam width and fallback passes. That is the honest way to make Model 5 more thorough in this stack: `large-v3` is already the largest standard checkpoint, so there is no larger official Whisper weight to download.
+
+| Profile | Beam | Temperature passes | Intended use |
+| --- | ---: | ---: | --- |
+| `model-1` | 8 | 1 | Existing behavior |
+| `model-2` | 10 | 1 | Careful decoding |
+| `model-3` | 12 | 2 | High accuracy |
+| `model-4` | 16 | 3 | Difficult/noisy speech |
+| `model-5` | 20 | 4 | Maximum CPU accuracy |
+
+The selector is applied when a new WebSocket capture starts and is disabled during capture. It is stored in the browser's local storage for convenience. All profiles report `device="cpu"` and `compute_type="int8"`; only the final decoding breadth changes. The draft path uses a smaller beam and reuses the same loaded bundle, avoiding a second large model in memory.
 
 Expect the following:
 
 - The first capture downloads a large model cache from Hugging Face and can take a long time.
 - CPU large-v3 can be slower than real time, especially on older or low-power machines.
-- RAM and disk requirements are materially higher than `small.en` or `medium.en`.
-- If large-v3 is not practical, use `medium.en` or `large-v3-turbo` explicitly; do not silently change the default back to a small model when investigating accuracy.
-- Model status is available at `GET /api/health` and is sent over the WebSocket as `model` messages.
+- Model 5 can take much longer to finish an utterance. This is expected; final audio is not discarded.
+- Model status is available at `GET /api/health`, the five choices at `GET /api/models`, and live state is sent over the WebSocket as `model` messages.
 
-Model aliases are defined in `notetaker/transcription.py`. A custom value is passed through to faster-whisper, so a new model can be tested with `--model` without changing the loader.
+Model checkpoint aliases are defined in `notetaker/transcription.py`; the selectable profile definitions live in `notetaker/config.py`. A custom value is still passed through to faster-whisper, so a new checkpoint can be tested with `--model` without changing the loader.
 
 ## Running locally
 
@@ -59,7 +68,7 @@ python NoteTaker.py --host 127.0.0.1 --port 8000
 
 Open the URL printed by the CLI. The first **Start capture** initializes Silero VAD and the Whisper model. Allow the browser microphone prompt, speak, then press **Stop capture** and wait for the final note event.
 
-The command-line options override environment/config values for the current process. `notetaker.toml` is the checked-in default source, and environment variables override that file. Do not put API keys in the TOML file or in committed notes.
+The command-line options override environment/config values for the current process. `notetaker.toml` is the checked-in default source, and environment variables override that file. The browser selector is a per-browser preference for the next capture; it does not edit `notetaker.toml`. Do not put API keys in the TOML file or in committed notes.
 
 ## Listening layer
 
@@ -129,7 +138,7 @@ Check the browser console for JavaScript syntax errors, then check that the page
 
 ### Model download appears stuck
 
-Large-v3 is intentionally slow to download and initialize. Check the terminal, `/api/health`, available disk space, and outbound access to the model host. A model cache may be partially present; retrying should reuse completed files.
+Large-v3 is intentionally slow to download and initialize. Check the selected profile, the status pill, the terminal, `/api/health`, `/api/models`, available disk space, and outbound access to the model host. A model cache may be partially present; retrying should reuse completed files. Models 2–5 normally reuse the same large-v3 cache and spend more time decoding rather than downloading another checkpoint.
 
 ### Words at the start or end are missing
 
@@ -137,7 +146,7 @@ Inspect the `listening/` thresholds first. Increase `preroll_seconds` and `end_s
 
 ### The transcript lags
 
-This is expected with full large-v3 on CPU. Increase `partial_seconds`, keep `draft_model` equal to `model` to avoid a second model only when memory permits, and preserve final events. Never solve lag by dropping final utterances or replacing the accuracy-first model without documenting the trade-off.
+This is expected with full large-v3 on CPU, especially with Model 4 or Model 5. Switch back to Model 1–2 for quicker final events, or increase `partial_seconds`; preserve final events. Never solve lag by dropping final utterances or silently changing the selected accuracy profile.
 
 ### Speaker names are wrong
 

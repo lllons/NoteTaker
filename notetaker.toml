@@ -1,5 +1,6 @@
 [notetaker]
-# Full large-v3 is the accuracy-first CPU model. It is intentionally slower and downloads a large cache.
+# The web selector starts at Model 1, which preserves this current large-v3 behavior.
+# All five web profiles remain CPU-only; higher profiles widen final decoding instead of loading a larger checkpoint.
 model = "large-v3"
 # Reuse the same loaded model for partials so CPU memory is not doubled.
 draft_model = "large-v3"

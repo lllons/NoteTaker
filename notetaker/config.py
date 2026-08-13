@@ -7,6 +7,97 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+
+@dataclass(frozen=True)
+class ModelProfile:
+    """A selectable CPU decoding profile for the web capture screen.
+
+    ``large-v3`` is already the largest standard Whisper checkpoint used by
+    this application. The higher profiles therefore spend more CPU time on
+    beam search and fallback passes rather than claiming a nonexistent larger
+    checkpoint. Keeping the checkpoint in the profile leaves room for adding
+    another CPU-compatible model later without changing the WebSocket API.
+    """
+
+    id: str
+    label: str
+    checkpoint: str
+    beam_size: int
+    temperatures: tuple[float, ...]
+    description: str
+    speed: str
+    quality: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "checkpoint": self.checkpoint,
+            "beam_size": self.beam_size,
+            "temperature_passes": list(self.temperatures),
+            "description": self.description,
+            "speed": self.speed,
+            "quality": self.quality,
+            "device": "cpu",
+            "compute_type": "int8",
+        }
+
+
+MODEL_PROFILES: tuple[ModelProfile, ...] = (
+    ModelProfile(
+        "model-1",
+        "Model 1 · Current",
+        "large-v3",
+        8,
+        (0.0,),
+        "The current large-v3 behavior with the existing accuracy settings.",
+        "slow",
+        "high",
+    ),
+    ModelProfile(
+        "model-2",
+        "Model 2 · Careful",
+        "large-v3",
+        10,
+        (0.0,),
+        "A wider beam for fewer uncertain word choices at a modest CPU cost.",
+        "slower",
+        "higher",
+    ),
+    ModelProfile(
+        "model-3",
+        "Model 3 · High accuracy",
+        "large-v3",
+        12,
+        (0.0, 0.15),
+        "High-accuracy decoding with one conservative fallback pass.",
+        "slower",
+        "very high",
+    ),
+    ModelProfile(
+        "model-4",
+        "Model 4 · Deep accuracy",
+        "large-v3",
+        16,
+        (0.0, 0.15, 0.3),
+        "Deep CPU decoding for difficult speech, accents, and noisy recordings.",
+        "very slow",
+        "very high",
+    ),
+    ModelProfile(
+        "model-5",
+        "Model 5 · Maximum CPU accuracy",
+        "large-v3",
+        20,
+        (0.0, 0.15, 0.3, 0.5),
+        "The most thorough option: maximum beam width and fallback passes on CPU.",
+        "slowest",
+        "maximum",
+    ),
+)
+MODEL_PROFILE_BY_ID = {profile.id: profile for profile in MODEL_PROFILES}
+DEFAULT_MODEL_PROFILE_ID = "model-1"
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility

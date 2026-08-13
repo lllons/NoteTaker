@@ -68,14 +68,15 @@ python NoteTaker.py --host 0.0.0.0 --port 8000
 
 Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser. If the app is running in a hosted preview or container, use the preview URL supplied by that environment rather than replacing `0.0.0.0` with a public address.
 
-The first capture can take longer because the configured Whisper models are loaded and downloaded when capture starts. Once the page opens:
+The first capture can take longer because the selected Whisper model is loaded and downloaded when capture starts. Once the page opens:
 
-1. Press **Start capture**.
-2. Allow microphone access when the browser asks.
-3. Speak normally or play audio near the selected microphone.
-4. Press **Stop capture** when finished.
-5. Wait for the final segment to flush and for the live note to be saved.
-6. Search the **Knowledge base** panel or open an export from the saved note.
+1. Choose one of the five **CPU transcription model** profiles. The selection is remembered in this browser and applies to the next capture.
+2. Press **Start capture**.
+3. Allow microphone access when the browser asks.
+4. Speak normally or play audio near the selected microphone.
+5. Press **Stop capture** when finished.
+6. Wait for the final segment to flush and for the live note to be saved.
+7. Search the **Knowledge base** panel or open an export from the saved note.
 
 Audio is processed locally by default. The browser sends PCM audio to the local NoteTaker process over its WebSocket connection; no external transcription service is contacted unless you configure an optional enrichment provider.
 
@@ -156,7 +157,19 @@ Once `.venv` is activated, use `python` for the remaining commands on every plat
 
 ## Choosing a transcription model
 
-The checked-in defaults in `notetaker.toml` are:
+The page now has a **CPU transcription model** selector with five accuracy profiles. Model 1 preserves the current `large-v3` behavior; Models 2–5 spend progressively more CPU time searching for a better decode. This project is already using the largest standard Whisper checkpoint available to `faster-whisper`, so the higher choices are stronger decoding profiles around the same `large-v3` weights rather than misleadingly claiming a larger checkpoint.
+
+| Web choice | Checkpoint | Final beam | Fallback passes | Trade-off |
+| --- | --- | ---: | ---: | --- |
+| **Model 1 · Current** | `large-v3` | 8 | 1 | Current behavior; slow |
+| **Model 2 · Careful** | `large-v3` | 10 | 1 | More CPU, fewer uncertain choices |
+| **Model 3 · High accuracy** | `large-v3` | 12 | 2 | Higher accuracy, slower final segments |
+| **Model 4 · Deep accuracy** | `large-v3` | 16 | 3 | Intended for difficult speech and noise |
+| **Model 5 · Maximum CPU accuracy** | `large-v3` | 20 | 4 | Slowest and most thorough option |
+
+All five choices load with `device="cpu"` and `compute_type="int8"`. The selector is disabled during capture so a model cannot change halfway through an utterance. Choose another profile after stopping; the next capture reports its status and downloads the checkpoint only if it is not already cached. Since the profiles share `large-v3` weights, switching between them normally does not require a second model copy.
+
+The checked-in defaults in `notetaker.toml` remain:
 
 ```toml
 model = "large-v3"
@@ -166,9 +179,7 @@ beam_size = 8
 threads = 0
 ```
 
-The default is the full Whisper large-v3 model running on CPU with int8 weights. It is substantially slower and uses more memory than the smaller models, but it is the accuracy-first choice when preserving speech matters more than live latency. The draft path reuses the same loaded model instead of downloading a second copy.
-
-To choose another model explicitly:
+The selected profile is remembered by the browser, while the TOML and command-line values still control the server's initial model and non-web launches. To choose the underlying model explicitly from the command line:
 
 ```bash
 python NoteTaker.py \
@@ -181,8 +192,8 @@ python NoteTaker.py \
 
 Useful guidance:
 
-- Use `large-v3` for the highest local transcription quality and accept slow CPU inference.
-- Use `large-v3-turbo` or `medium.en` only when the full model is too slow or memory-heavy.
+- Start with **Model 1**. Move to **Model 3–5** when exact names, numbers, accents, or noisy speech matter more than latency.
+- Model 5 can take substantially longer to finish each utterance on CPU; that is expected and final audio is retained.
 - Use `--lang en` or another known language code when the recording is consistently one language. Omit `--lang` to let Whisper detect it.
 - Provide domain vocabulary so technical names are more likely to be preserved:
 
@@ -190,10 +201,9 @@ Useful guidance:
   python NoteTaker.py --hotwords "pgvector, CTranslate2, FastAPI, NoteTaker"
   ```
 
-- Increase `--beam` for a possible accuracy improvement at the cost of latency. Keep it at the default unless you have tested the trade-off on your hardware.
 - Set `--threads` to a positive CPU thread count when you need to constrain resource usage. `0` lets the runtime choose.
 
-Models are cached by the underlying faster-whisper stack after the first download. If the model cannot be downloaded, verify network access and disk space, then retry with a smaller model.
+The model cache is managed by the underlying faster-whisper stack after the first download. If loading fails, check the model status pill, terminal output, network access, and disk space before retrying.
 
 ## Configuration
 
@@ -271,7 +281,8 @@ Every transcript segment includes `speaker` and `speaker_confidence`. The built-
 
 With the server running, the main endpoints are:
 
-- `GET /api/health` — service, provider, and model status.
+- `GET /api/health` — service, provider, selected model, and model status.
+- `GET /api/models` — the five CPU model profiles shown by the web selector.
 - `GET /api/notes?query=vector&limit=20` — search saved notes and extracted evidence.
 - `GET /api/notes/{id}` — retrieve a complete structured note.
 - `GET /api/notes/{id}/export/{format}` — export as `md`, `pdf`, `docx`, `html`, `json`, `anki`, `obsidian`, or `notion`.
@@ -314,7 +325,8 @@ notetaker/
   rendering.py               Markdown, HTML, JSON, Anki, PDF, DOCX exports
   provider.py                optional OpenAI-compatible LLM plugin boundary
   web.py                     embedded capture and knowledge-base UI
-tests/test_knowledge.py      offline unit tests
+tests/test_knowledge.py      offline knowledge-pipeline tests
+tests/test_model_profiles.py offline CPU model-selector tests
 notes/notes.md               developer guide and operational notes
 notetaker.toml               checked-in runtime defaults
 requirements.txt             Python dependencies
@@ -356,9 +368,10 @@ The second form remains auditable: extracted items can be traced to source segme
 
 ## Performance and privacy notes
 
-- The first model load and download are the most expensive startup steps; the process reuses loaded models for later sessions.
+- The first model load and download are the most expensive startup steps; the process reuses loaded weights for later sessions.
 - The full large-v3 model runs on CPU with int8 weights; expect slow first load, high memory use, and slower-than-real-time decoding on many machines.
-- The draft path reuses the final model, and stale partial work is dropped so a slow CPU cannot delay final utterances.
+- The five web profiles change final decoding breadth and fallback passes; Model 5 is the most CPU-intensive accuracy profile.
+- The draft path uses a small beam on the same final model, and stale partial work is dropped so a slow CPU cannot delay final utterances.
 - Model inference uses bounded worker execution so concurrent transcription does not corrupt model state.
 - SQLite keeps durable notes on disk instead of retaining every session only in memory.
 - Extraction is incremental for live sessions, and the optional provider is not required for saving notes.
@@ -387,11 +400,11 @@ Allow the site in the browser's microphone permissions. On macOS, also enable th
 
 ### The first run is slow or appears idle
 
-The server prints its local URL immediately, then the large-v3 download and initialization begin when you press **Start capture**. Check the model status shown in the page and terminal, confirm network access and disk space, and expect the first load to take a while.
+The server prints its local URL immediately, then the selected large-v3 profile downloads and initializes when you press **Start capture**. Check the selected model and status pill in the page, plus the terminal, confirm network access and disk space, and expect the first load to take a while.
 
 ### Transcription quality is poor
 
-The default is already the largest configured model. Set a known `--lang`, keep `--beam 8` or increase it, pass domain-specific `--hotwords`, and check microphone input level. The listening layer keeps a one-second pre-roll, longer pauses, and trailing partial frames; low-confidence segments remain visible for manual review rather than being silently “corrected.”
+The default checkpoint is already the largest configured model. Start with Model 1, then choose Model 3–5 for wider CPU decoding, set a known `--lang`, pass domain-specific `--hotwords`, and check microphone input level. The listening layer keeps a one-second pre-roll, longer pauses, and trailing partial frames; low-confidence segments remain visible for manual review rather than being silently “corrected.”
 
 ### The port is already in use
 

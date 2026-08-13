@@ -12,7 +12,7 @@ import numpy as np
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from .config import AppConfig
+from .config import AppConfig, DEFAULT_MODEL_PROFILE_ID
 from .models import TranscriptSegment
 from .pipeline import KnowledgePipeline
 from .provider import provider_from_config
@@ -39,12 +39,25 @@ def index() -> str:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    status = runtime.status()
     return {
         "ok": True,
         "service": "notetaker",
         "provider": provider.name if provider else "local-deterministic",
-        "model": config.model,
-        "models": runtime.status(),
+        "model": status["profile"]["checkpoint"],
+        "models": status,
+        "model_options": runtime.model_options(),
+    }
+
+
+@app.get("/api/models")
+def models() -> dict[str, Any]:
+    status = runtime.status()
+    return {
+        "selected": status["profile_id"],
+        "models": runtime.model_options(),
+        "device": "cpu",
+        "compute_type": "int8",
     }
 
 
@@ -124,10 +137,24 @@ async def query(payload: dict[str, Any]) -> dict[str, Any]:
 @app.websocket("/ws")
 async def stream(ws: WebSocket) -> None:
     await ws.accept()
+    requested_profile = ws.query_params.get("model", DEFAULT_MODEL_PROFILE_ID)
+    try:
+        runtime.select_model(requested_profile)
+    except ValueError as exc:
+        await ws.send_text(json.dumps({
+            "t": "error",
+            "scope": "model",
+            "message": str(exc),
+            "models": runtime.status(),
+        }))
+        await ws.close(code=1008)
+        return
+    selected_status = runtime.status()
     await ws.send_text(json.dumps({
         "t": "ready",
-        "model": f"{config.model} + {config.draft_model}",
-        "model_status": runtime.status(),
+        "model": selected_status["profile"]["label"],
+        "model_status": selected_status,
+        "model_options": runtime.model_options(),
     }))
     segmenter: Segmenter | None = None
     session_segments: list[TranscriptSegment] = []
@@ -216,6 +243,18 @@ async def stream(ws: WebSocket) -> None:
                     payload = json.loads(message["text"])
                     event_name = payload.get("t")
                     if event_name == "config":
+                        requested_profile = payload.get("model")
+                        if requested_profile and requested_profile != runtime.status()["profile_id"]:
+                            if elapsed > 0 or session_segments or any(not task.done() for task in tasks):
+                                await ws.send_text(json.dumps({"t": "error", "scope": "model", "message": "Stop capture before changing the model."}))
+                                continue
+                            try:
+                                await ws.send_text(json.dumps({"t": "model", **runtime.select_model(str(requested_profile)), "state": "loading"}))
+                                await asyncio.to_thread(runtime.ensure_loaded)
+                                await ws.send_text(json.dumps({"t": "model", **runtime.status()}))
+                            except Exception as exc:
+                                await ws.send_text(json.dumps({"t": "error", "scope": "model", "message": f"model selection failed: {type(exc).__name__}: {str(exc)[:240]}", "models": runtime.status()}))
+                                continue
                         requested_rate = float(payload.get("sample_rate", SR))
                         if not math.isfinite(requested_rate) or not 8000 <= requested_rate <= 192000:
                             await ws.send_text(json.dumps({"t": "error", "scope": "audio", "message": "unsupported browser sample rate"}))

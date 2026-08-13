@@ -17,10 +17,12 @@ import numpy as np
 from faster_whisper import WhisperModel
 
 from listening.audio import SR, Segmenter, Vad, resample_audio
+from .config import MODEL_PROFILE_BY_ID, MODEL_PROFILES, ModelProfile
 from .models import TranscriptSegment, TranscriptWord
 
 __all__ = [
     "MODELS",
+    "MODEL_PROFILES",
     "SR",
     "Segmenter",
     "TranscriptionRuntime",
@@ -76,7 +78,67 @@ class TranscriptionRuntime:
         self._load_lock = threading.Lock()
         self._model_state = "not-loaded"
         self._model_error: str | None = None
+        self._loaded_checkpoint: str | None = None
+        self._loaded_draft_checkpoint: str | None = None
+        configured_model = str(getattr(config, "model", "") or "")
+        self._profile = next(
+            (profile for profile in MODEL_PROFILES if profile.checkpoint == configured_model),
+            self._custom_profile(configured_model),
+        )
+        self._draft_checkpoint = str(getattr(config, "draft_model", configured_model) or configured_model)
         self.speakers = SpeakerLabeler(config.diarization)
+
+    @staticmethod
+    def _custom_profile(checkpoint: str) -> ModelProfile:
+        return ModelProfile(
+            "custom",
+            f"Custom · {checkpoint or 'configured model'}",
+            checkpoint or "large-v3",
+            8,
+            (0.0,),
+            "The model configured by the command line or environment.",
+            "configured",
+            "configured",
+        )
+
+    def model_options(self) -> list[dict[str, Any]]:
+        """Return the five safe web choices without exposing model internals."""
+        return [profile.to_dict() for profile in MODEL_PROFILES]
+
+    def select_model(self, profile_id: str) -> dict[str, Any]:
+        """Select a web profile before capture; every profile remains CPU-only."""
+        profile = MODEL_PROFILE_BY_ID.get(str(profile_id))
+        if profile is None:
+            raise ValueError(f"unknown model profile: {profile_id}")
+        with self._load_lock:
+            checkpoint_changed = (
+                self._loaded_checkpoint is not None
+                and (
+                    self._loaded_checkpoint != profile.checkpoint
+                    or self._loaded_draft_checkpoint != profile.checkpoint
+                )
+            )
+            if checkpoint_changed:
+                self._close_bundle(self.final)
+                self._close_bundle(self.draft)
+                self.final = None
+                self.draft = None
+                self._loaded_checkpoint = None
+                self._loaded_draft_checkpoint = None
+            self._profile = profile
+            self._draft_checkpoint = profile.checkpoint
+            self._model_error = None
+            self._model_state = "ready" if self.final is not None and self.draft is not None else "not-loaded"
+        return self.status()
+
+    @staticmethod
+    def _close_bundle(bundle: ModelBundle | None) -> None:
+        if bundle is None:
+            return
+        try:
+            bundle.executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # pragma: no cover - Python 3.8 compatibility
+            bundle.executor.shutdown(wait=False)
 
     def _load(self, name: str) -> ModelBundle:
         repo = MODELS.get(name, name)
@@ -91,16 +153,19 @@ class TranscriptionRuntime:
     def status(self) -> dict[str, Any]:
         """Report configured and loaded models without exposing model internals."""
         with self._load_lock:
+            profile = self._profile
             loaded: list[str] = []
-            if self.final is not None:
-                loaded.append(self.config.model)
-            if self.draft is not None and self.config.draft_model != self.config.model:
-                loaded.append(self.config.draft_model)
+            if self.final is not None and self._loaded_checkpoint == profile.checkpoint:
+                loaded.append(profile.checkpoint)
+            if self.draft is not None and self._loaded_draft_checkpoint == self._draft_checkpoint and self._draft_checkpoint != profile.checkpoint:
+                loaded.append(self._draft_checkpoint)
             return {
                 "state": self._model_state,
+                "profile_id": profile.id,
+                "profile": profile.to_dict(),
                 "configured": {
-                    "final": self.config.model,
-                    "draft": self.config.draft_model,
+                    "final": profile.checkpoint,
+                    "draft": self._draft_checkpoint,
                 },
                 "loaded": loaded,
                 "device": "cpu",
@@ -110,16 +175,25 @@ class TranscriptionRuntime:
 
     def ensure_loaded(self) -> None:
         with self._load_lock:
-            if self.final is not None and self.draft is not None:
+            target_checkpoint = self._profile.checkpoint
+            target_draft = self._draft_checkpoint
+            if (
+                self.final is not None
+                and self.draft is not None
+                and self._loaded_checkpoint == target_checkpoint
+                and self._loaded_draft_checkpoint == target_draft
+            ):
                 self._model_state = "ready"
                 return
             self._model_state = "loading"
             self._model_error = None
             try:
                 if self.final is None:
-                    self.final = self._load(self.config.model)
+                    self.final = self._load(target_checkpoint)
                 if self.draft is None:
-                    self.draft = self.final if self.config.draft_model == self.config.model else self._load(self.config.draft_model)
+                    self.draft = self.final if target_draft == target_checkpoint else self._load(target_draft)
+                self._loaded_checkpoint = target_checkpoint
+                self._loaded_draft_checkpoint = target_draft
                 self._model_state = "ready"
             except Exception as exc:
                 self._model_state = "error"
@@ -141,7 +215,9 @@ class TranscriptionRuntime:
         model with a smaller beam to keep the UI responsive when possible.
         """
         self.ensure_loaded()
-        bundle = self.final if final else self.draft
+        with self._load_lock:
+            profile = self._profile
+            bundle = self.final if final else self.draft
         assert bundle is not None
         if audio is None or not len(audio):
             return [], self.config.language
@@ -161,8 +237,8 @@ class TranscriptionRuntime:
             raw_segments, info = bundle.model.transcribe(
                 audio,
                 language=self.config.language,
-                beam_size=max(1, self.config.beam_size if final else min(self.config.beam_size, 2)),
-                temperature=0.0,
+                beam_size=max(1, (int(self.config.beam_size) if profile.id in {"model-1", "custom"} else profile.beam_size) if final else 2),
+                temperature=list(profile.temperatures) if final else 0.0,
                 initial_prompt=initial_prompt or None,
                 hotwords=self.config.hotwords if final else None,
                 condition_on_previous_text=False,
