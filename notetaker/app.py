@@ -17,8 +17,10 @@ from .models import TranscriptSegment
 from .pipeline import KnowledgePipeline
 from .provider import provider_from_config
 from .rendering import render
+from listening.audio import SR, Segmenter, resample_audio
+
 from .storage import KnowledgeStore
-from .transcription import SR, Segmenter, TranscriptionRuntime, resample_audio
+from .transcription import TranscriptionRuntime
 from .web import PAGE
 
 
@@ -133,6 +135,7 @@ async def stream(ws: WebSocket) -> None:
     elapsed = 0.0
     source_sample_rate = float(SR)
     tasks: set[asyncio.Task[Any]] = set()
+    partial_task: asyncio.Task[Any] | None = None
     final_lock = asyncio.Lock()
 
     async def process(event_type: str, audio: Any, sid: int, offset: float) -> None:
@@ -225,8 +228,15 @@ async def stream(ws: WebSocket) -> None:
                     await ws.send_text(json.dumps({"t": "error", "scope": "stream", "message": "ignored malformed control message"}))
                     continue
             for event_type, audio, sid in events:
+                # Large-v3 is intentionally accuracy-first and can be slower
+                # than real time on CPU. Never let stale partials pile up and
+                # delay a final utterance; the final transcript always wins.
+                if event_type == "partial" and partial_task is not None and not partial_task.done():
+                    continue
                 task = asyncio.create_task(process(event_type, audio, sid, max(0.0, elapsed - len(audio) / SR)))
                 tasks.add(task)
+                if event_type == "partial":
+                    partial_task = task
                 task.add_done_callback(tasks.discard)
     except Exception as exc:
         # Disconnects and browser microphone shutdowns are normal session endings.

@@ -159,28 +159,30 @@ Once `.venv` is activated, use `python` for the remaining commands on every plat
 The checked-in defaults in `notetaker.toml` are:
 
 ```toml
-model = "small.en"
-draft_model = "base.en"
+model = "large-v3"
+draft_model = "large-v3"
 language = "auto"
-beam_size = 5
+beam_size = 8
 threads = 0
 ```
 
-The final model handles completed speech and the draft model provides faster live feedback. Start with the defaults, then choose a larger model if accuracy matters more than latency:
+The default is the full Whisper large-v3 model running on CPU with int8 weights. It is substantially slower and uses more memory than the smaller models, but it is the accuracy-first choice when preserving speech matters more than live latency. The draft path reuses the same loaded model instead of downloading a second copy.
+
+To choose another model explicitly:
 
 ```bash
 python NoteTaker.py \
-  --model large-v3-turbo \
-  --draft base.en \
-  --beam 5 \
+  --model large-v3 \
+  --draft large-v3 \
+  --beam 8 \
   --host 0.0.0.0 \
   --port 8000
 ```
 
 Useful guidance:
 
-- Use `small.en`/`base.en` for a practical CPU-oriented starting point.
-- Use `large-v3-turbo` when the machine has enough memory and you can accept slower startup or inference.
+- Use `large-v3` for the highest local transcription quality and accept slow CPU inference.
+- Use `large-v3-turbo` or `medium.en` only when the full model is too slow or memory-heavy.
 - Use `--lang en` or another known language code when the recording is consistently one language. Omit `--lang` to let Whisper detect it.
 - Provide domain vocabulary so technical names are more likely to be preserved:
 
@@ -199,24 +201,29 @@ Runtime defaults live in `notetaker.toml`. Environment variables override values
 
 | Setting | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
-| `model` | `NOTE_TAKER_MODEL` | `small.en` | Final transcription model |
-| `draft_model` | `NOTE_TAKER_DRAFT_MODEL` | `base.en` | Faster live transcription model |
+| `model` | `NOTE_TAKER_MODEL` | `large-v3` | Final CPU transcription model |
+| `draft_model` | `NOTE_TAKER_DRAFT_MODEL` | `large-v3` | Partial/live model; same model avoids a second cache |
 | `language` | `NOTE_TAKER_LANGUAGE` | automatic | Language code, or `auto` |
-| `beam_size` | `NOTE_TAKER_BEAM_SIZE` | `5` | Whisper decoding breadth |
+| `beam_size` | `NOTE_TAKER_BEAM_SIZE` | `8` | Whisper decoding breadth |
 | `threads` | `NOTE_TAKER_THREADS` | `0` | CPU thread limit; `0` is automatic |
 | `hotwords` | `NOTE_TAKER_HOTWORDS` | empty | Comma-separated domain terms |
 | `data_dir` | `NOTE_TAKER_DATA_DIR` | `data` | SQLite and application data directory |
-| `context_chars` | `NOTE_TAKER_CONTEXT_CHARS` | `800` | Prior transcript context for live decoding |
-| `max_segment_seconds` | `NOTE_TAKER_MAX_SEGMENT_SECONDS` | `20` | Maximum VAD segment length |
-| `min_segment_seconds` | `NOTE_TAKER_MIN_SEGMENT_SECONDS` | `0.25` | Minimum audio segment length |
+| `context_chars` | `NOTE_TAKER_CONTEXT_CHARS` | `1200` | Prior transcript context for live decoding |
+| `max_segment_seconds` | `NOTE_TAKER_MAX_SEGMENT_SECONDS` | `30` | Maximum VAD segment length |
+| `min_segment_seconds` | `NOTE_TAKER_MIN_SEGMENT_SECONDS` | `0.15` | Minimum audio segment length |
+| `vad_on_threshold` | `NOTE_TAKER_VAD_ON_THRESHOLD` | `0.35` | Recall-first speech start threshold |
+| `vad_off_threshold` | `NOTE_TAKER_VAD_OFF_THRESHOLD` | `0.20` | Recall-first speech continuation threshold |
+| `preroll_seconds` | `NOTE_TAKER_PREROLL_SECONDS` | `1.0` | Audio retained before speech onset |
+| `end_silence_seconds` | `NOTE_TAKER_END_SILENCE_SECONDS` | `1.4` | Silence required to close an utterance |
+| `partial_seconds` | `NOTE_TAKER_PARTIAL_SECONDS` | `4.0` | Interval between draft updates |
 | `provider_timeout` | `NOTE_TAKER_PROVIDER_TIMEOUT` | `45` | Optional provider request timeout |
 | `diarization` | `NOTE_TAKER_DIARIZATION` | `labels-only` | Speaker-label mode |
 
 For example, a low-resource Linux or macOS run can be started with:
 
 ```bash
-NOTE_TAKER_MODEL=base.en \
-NOTE_TAKER_DRAFT_MODEL=tiny.en \
+NOTE_TAKER_MODEL=medium.en \
+NOTE_TAKER_DRAFT_MODEL=medium.en \
 NOTE_TAKER_THREADS=4 \
 python NoteTaker.py --host 0.0.0.0 --port 8000
 ```
@@ -294,10 +301,12 @@ Markdown exports include a table of contents, collapsible reference transcript a
 
 ```text
 NoteTaker.py                 compatibility CLI (`python NoteTaker.py`)
+listening/
+  audio.py                  PCM resampling, Silero VAD, recall-first boundaries
 notetaker/
   app.py                     FastAPI routes, WebSocket capture, retrieval API
   config.py                  typed TOML and environment configuration
-  transcription.py           faster-whisper, VAD, words, confidence, language
+  transcription.py           CPU Whisper loading, words, confidence, language
   extractor.py               conservative semantic and fact extraction
   pipeline.py                incremental note orchestration
   models.py                  typed transcript and knowledge schema
@@ -306,6 +315,7 @@ notetaker/
   provider.py                optional OpenAI-compatible LLM plugin boundary
   web.py                     embedded capture and knowledge-base UI
 tests/test_knowledge.py      offline unit tests
+notes/notes.md               developer guide and operational notes
 notetaker.toml               checked-in runtime defaults
 requirements.txt             Python dependencies
 data/knowledge.sqlite3       created on first run
@@ -347,7 +357,8 @@ The second form remains auditable: extracted items can be traced to source segme
 ## Performance and privacy notes
 
 - The first model load and download are the most expensive startup steps; the process reuses loaded models for later sessions.
-- The draft model provides live feedback while the final model processes completed utterances.
+- The full large-v3 model runs on CPU with int8 weights; expect slow first load, high memory use, and slower-than-real-time decoding on many machines.
+- The draft path reuses the final model, and stale partial work is dropped so a slow CPU cannot delay final utterances.
 - Model inference uses bounded worker execution so concurrent transcription does not corrupt model state.
 - SQLite keeps durable notes on disk instead of retaining every session only in memory.
 - Extraction is incremental for live sessions, and the optional provider is not required for saving notes.
@@ -376,11 +387,11 @@ Allow the site in the browser's microphone permissions. On macOS, also enable th
 
 ### The first run is slow or appears idle
 
-The server prints its local URL immediately, then model downloads and initialization begin when you press **Start capture**. Check the model status shown in the page and the terminal output, confirm network access, and start with `small.en` or `base.en` before switching to `large-v3-turbo`.
+The server prints its local URL immediately, then the large-v3 download and initialization begin when you press **Start capture**. Check the model status shown in the page and terminal, confirm network access and disk space, and expect the first load to take a while.
 
 ### Transcription quality is poor
 
-Use the largest model your hardware can sustain, set a known `--lang`, increase `--beam`, and pass domain-specific `--hotwords`. Also check microphone input level and reduce background noise. Low-confidence segments remain visible for manual review rather than being silently “corrected.”
+The default is already the largest configured model. Set a known `--lang`, keep `--beam 8` or increase it, pass domain-specific `--hotwords`, and check microphone input level. The listening layer keeps a one-second pre-roll, longer pauses, and trailing partial frames; low-confidence segments remain visible for manual review rather than being silently “corrected.”
 
 ### The port is already in use
 

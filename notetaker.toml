@@ -1,16 +1,23 @@
 [notetaker]
-# Use large-v3-turbo when the machine can sustain it; small.en is a practical CPU default.
-model = "small.en"
-draft_model = "base.en"
+# Full large-v3 is the accuracy-first CPU model. It is intentionally slower and downloads a large cache.
+model = "large-v3"
+# Reuse the same loaded model for partials so CPU memory is not doubled.
+draft_model = "large-v3"
 language = "auto"
-beam_size = 5
+beam_size = 8
 threads = 0
 # Comma-separated names, jargon, code terms, or product names for Whisper prompting.
 hotwords = ""
 data_dir = "data"
-context_chars = 800
-max_segment_seconds = 20
-min_segment_seconds = 0.25
+context_chars = 1200
+max_segment_seconds = 30
+min_segment_seconds = 0.15
+# Recall-first listening boundaries: keep quiet starts, pauses, and trailing words.
+vad_on_threshold = 0.35
+vad_off_threshold = 0.20
+preroll_seconds = 1.0
+end_silence_seconds = 1.4
+partial_seconds = 4.0
 provider_timeout = 45
 # labels-only preserves speaker fields without pretending heuristic labels are diarization.
 diarization = "labels-only"
