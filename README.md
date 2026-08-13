@@ -53,7 +53,8 @@ python -m pip install -r requirements.txt
 
 The requirements are intentionally small:
 
-- `faster-whisper` — local Whisper transcription.
+- `faster-whisper` — local Whisper transcription and CTranslate2 model loading.
+- `onnxruntime` — CPU Silero VAD used to find speech boundaries.
 - `fastapi` — HTTP and WebSocket application server.
 - `uvicorn[standard]` — ASGI server.
 - `numpy` — PCM audio conversion and signal handling.
@@ -68,9 +69,9 @@ python NoteTaker.py --host 0.0.0.0 --port 8000
 
 Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser. If the app is running in a hosted preview or container, use the preview URL supplied by that environment rather than replacing `0.0.0.0` with a public address.
 
-The first capture can take longer because the selected Whisper model is loaded and downloaded when capture starts. Once the page opens:
+The first capture can take longer because the selected Whisper model and CPU VAD assets are loaded and downloaded when capture starts. Once the page opens:
 
-1. Choose one of the five **CPU transcription model** profiles. The selection is remembered in this browser and applies to the next capture.
+1. Choose one of the **CPU transcription model** choices. The selection is remembered in this browser and applies to the next capture. Start with **Large-v3 · Best overall** or **Large-v3 · Maximum CPU decode** when retaining every detail matters most.
 2. Press **Start capture**.
 3. Allow microphone access when the browser asks.
 4. Speak normally or play audio near the selected microphone.
@@ -157,17 +158,20 @@ Once `.venv` is activated, use `python` for the remaining commands on every plat
 
 ## Choosing a transcription model
 
-The page now has a **CPU transcription model** selector with five accuracy profiles. Model 1 preserves the current `large-v3` behavior; Models 2–5 spend progressively more CPU time searching for a better decode. This project is already using the largest standard Whisper checkpoint available to `faster-whisper`, so the higher choices are stronger decoding profiles around the same `large-v3` weights rather than misleadingly claiming a larger checkpoint.
+The web selector now lists real public Hugging Face repositories that can be loaded directly by `faster-whisper`/CTranslate2. Every choice is forced to `device="cpu"` with `compute_type="int8"`; larger choices may be very slow but preserve more detail than the small fallbacks.
 
-| Web choice | Checkpoint | Final beam | Fallback passes | Trade-off |
-| --- | --- | ---: | ---: | --- |
-| **Model 1 · Current** | `large-v3` | 8 | 1 | Current behavior; slow |
-| **Model 2 · Careful** | `large-v3` | 10 | 1 | More CPU, fewer uncertain choices |
-| **Model 3 · High accuracy** | `large-v3` | 12 | 2 | Higher accuracy, slower final segments |
-| **Model 4 · Deep accuracy** | `large-v3` | 16 | 3 | Intended for difficult speech and noise |
-| **Model 5 · Maximum CPU accuracy** | `large-v3` | 20 | 4 | Slowest and most thorough option |
+| Choice | Hugging Face checkpoint | Best use |
+| --- | --- | --- |
+| **Large-v3 · Best overall** | `Systran/faster-whisper-large-v3` | Best general accuracy; recommended default |
+| **Large-v3 · Maximum CPU decode** | `Systran/faster-whisper-large-v3` | Same weights with beam 20 and fallback passes |
+| **Distil-large-v3 · High quality** | `Systran/faster-distil-whisper-large-v3` | Large distilled model with lower CPU cost |
+| **Large-v3 Turbo · Faster** | `deepdml/faster-whisper-large-v3-turbo-ct2` | Faster large-model capture with a quality trade-off |
+| **Medium / Medium English** | `Systran/faster-whisper-medium(.en)` | Strong lower-memory multilingual or English capture |
+| **Small / Small English** | `Systran/faster-whisper-small(.en)` | Moderate CPU fallback |
+| **Base / Base English** | `Systran/faster-whisper-base(.en)` | Lightweight fallback |
+| **Tiny / Tiny English** | `Systran/faster-whisper-tiny(.en)` | Only for severely constrained machines |
 
-All five choices load with `device="cpu"` and `compute_type="int8"`. The selector is disabled during capture so a model cannot change halfway through an utterance. Choose another profile after stopping; the next capture reports its status and downloads the checkpoint only if it is not already cached. Since the profiles share `large-v3` weights, switching between them normally does not require a second model copy.
+The selector is disabled while capture is active. Changing it applies to the next WebSocket session; switching between different checkpoints releases the old model before loading the new one so CPU memory is not needlessly doubled. Public model repositories do not require an API key. The raw `openai/whisper-large-v3` Transformers repository is not listed because the current application expects a CTranslate2 conversion; the official `Systran` conversion is the compatible choice.
 
 The checked-in defaults in `notetaker.toml` remain:
 
@@ -179,7 +183,7 @@ beam_size = 8
 threads = 0
 ```
 
-The selected profile is remembered by the browser, while the TOML and command-line values still control the server's initial model and non-web launches. To choose the underlying model explicitly from the command line:
+To choose a checkpoint explicitly from the command line:
 
 ```bash
 python NoteTaker.py \
@@ -192,8 +196,7 @@ python NoteTaker.py \
 
 Useful guidance:
 
-- Start with **Model 1**. Move to **Model 3–5** when exact names, numbers, accents, or noisy speech matter more than latency.
-- Model 5 can take substantially longer to finish each utterance on CPU; that is expected and final audio is retained.
+- Use **Large-v3 · Best overall** first. Use **Large-v3 · Maximum CPU decode** when final accuracy matters more than wait time.
 - Use `--lang en` or another known language code when the recording is consistently one language. Omit `--lang` to let Whisper detect it.
 - Provide domain vocabulary so technical names are more likely to be preserved:
 
@@ -203,7 +206,7 @@ Useful guidance:
 
 - Set `--threads` to a positive CPU thread count when you need to constrain resource usage. `0` lets the runtime choose.
 
-The model cache is managed by the underlying faster-whisper stack after the first download. If loading fails, check the model status pill, terminal output, network access, and disk space before retrying.
+Models are cached by faster-whisper after their first download. Check the model status pill and terminal if a large checkpoint is still downloading or initializing.
 
 ## Configuration
 
@@ -282,7 +285,7 @@ Every transcript segment includes `speaker` and `speaker_confidence`. The built-
 With the server running, the main endpoints are:
 
 - `GET /api/health` — service, provider, selected model, and model status.
-- `GET /api/models` — the five CPU model profiles shown by the web selector.
+- `GET /api/models` — the Hugging Face CPU model catalog shown by the web selector.
 - `GET /api/notes?query=vector&limit=20` — search saved notes and extracted evidence.
 - `GET /api/notes/{id}` — retrieve a complete structured note.
 - `GET /api/notes/{id}/export/{format}` — export as `md`, `pdf`, `docx`, `html`, `json`, `anki`, `obsidian`, or `notion`.
@@ -313,7 +316,7 @@ Markdown exports include a table of contents, collapsible reference transcript a
 ```text
 NoteTaker.py                 compatibility CLI (`python NoteTaker.py`)
 listening/
-  audio.py                  PCM resampling, Silero VAD, recall-first boundaries
+  audio.py                  PCM resampling, Silero/energy VAD, recall-first boundaries
 notetaker/
   app.py                     FastAPI routes, WebSocket capture, retrieval API
   config.py                  typed TOML and environment configuration
@@ -368,11 +371,12 @@ The second form remains auditable: extracted items can be traced to source segme
 
 ## Performance and privacy notes
 
-- The first model load and download are the most expensive startup steps; the process reuses loaded weights for later sessions.
-- The full large-v3 model runs on CPU with int8 weights; expect slow first load, high memory use, and slower-than-real-time decoding on many machines.
-- The five web profiles change final decoding breadth and fallback passes; Model 5 is the most CPU-intensive accuracy profile.
-- The draft path uses a small beam on the same final model, and stale partial work is dropped so a slow CPU cannot delay final utterances.
+- The first VAD/model load and download are the most expensive startup steps; later sessions reuse cached weights.
+- Large-v3 runs on CPU with int8 weights; expect high memory use and slower-than-real-time decoding on many machines.
+- The selector exposes actual Hugging Face CTranslate2 checkpoints plus a maximum-decode large-v3 profile; only one checkpoint is kept loaded at a time.
+- The draft path uses a small beam on the selected model, and stale partial work is dropped so a slow CPU cannot delay final utterances.
 - Model inference uses bounded worker execution so concurrent transcription does not corrupt model state.
+- Each capture receives a unique note ID and the browser waits for a final `flushed` confirmation before declaring the note saved.
 - SQLite keeps durable notes on disk instead of retaining every session only in memory.
 - Extraction is incremental for live sessions, and the optional provider is not required for saving notes.
 - Larger models and higher beam sizes generally improve recognition but increase memory use and latency.
@@ -398,13 +402,17 @@ python NoteTaker.py --host 0.0.0.0 --port 8000
 
 Allow the site in the browser's microphone permissions. On macOS, also enable the browser under **System Settings → Privacy & Security → Microphone**. Remote non-HTTPS pages may be blocked by the browser; use `127.0.0.1` locally or an HTTPS preview.
 
+### Capture ends with no speech detected
+
+Run `python -m pip install -r requirements.txt` again so `onnxruntime` is installed. The app uses Silero VAD on CPU when available and shows `energy-fallback` when it is not. If the fallback is shown, the microphone frames are still accepted, but installing `onnxruntime` gives better speech boundaries. Watch the level meter and wait for the `saved` confirmation after pressing **Stop capture**.
+
 ### The first run is slow or appears idle
 
-The server prints its local URL immediately, then the selected large-v3 profile downloads and initializes when you press **Start capture**. Check the selected model and status pill in the page, plus the terminal, confirm network access and disk space, and expect the first load to take a while.
+The server prints its local URL immediately, then the selected model and CPU VAD initialize when you press **Start capture**. Check the model/VAD status pill, the final `flushed` message, and the terminal. The first large-v3 download can take a while.
 
 ### Transcription quality is poor
 
-The default checkpoint is already the largest configured model. Start with Model 1, then choose Model 3–5 for wider CPU decoding, set a known `--lang`, pass domain-specific `--hotwords`, and check microphone input level. The listening layer keeps a one-second pre-roll, longer pauses, and trailing partial frames; low-confidence segments remain visible for manual review rather than being silently “corrected.”
+The default checkpoint is already the largest configured model. Start with **Large-v3 · Best overall**, use **Large-v3 · Maximum CPU decode** when wait time does not matter, and choose a smaller/turbo/distilled option only when CPU time or RAM is limiting. Set a known `--lang`, pass domain-specific `--hotwords`, and check microphone input level. The listening layer keeps a one-second pre-roll, longer pauses, and trailing partial frames; low-confidence segments remain visible for manual review rather than being silently “corrected.”
 
 ### The port is already in use
 

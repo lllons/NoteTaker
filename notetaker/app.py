@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
@@ -158,6 +159,7 @@ async def stream(ws: WebSocket) -> None:
     }))
     segmenter: Segmenter | None = None
     session_segments: list[TranscriptSegment] = []
+    session_note_id = f"live-{uuid4().hex}"
     context = ""
     elapsed = 0.0
     source_sample_rate = float(SR)
@@ -183,7 +185,7 @@ async def stream(ws: WebSocket) -> None:
                     context = " ".join(segment.text for segment in session_segments)[-config.context_chars:]
                     for segment in decoded:
                         await ws.send_text(json.dumps({"t": "segment", **segment.to_dict(), "partial": False}, ensure_ascii=False))
-                    note = await asyncio.to_thread(pipeline.create_note, session_segments, "Live capture", "live", "live-session", False)
+                    note = await asyncio.to_thread(pipeline.create_note, session_segments, "Live capture", "live", session_note_id, False)
                     await ws.send_text(json.dumps({"t": "note", "title": note.title, "id": note.id, "language": language}))
             else:
                 await ws.send_text(json.dumps({"t": "partial", "id": sid, "start": offset, "end": offset + len(audio) / SR, "text": text, "language": language}, ensure_ascii=False))
@@ -200,7 +202,7 @@ async def stream(ws: WebSocket) -> None:
 
     try:
         segmenter = await asyncio.to_thread(Segmenter, config)
-        await ws.send_text(json.dumps({"t": "vad", "state": "ready", "sample_rate": SR}))
+        await ws.send_text(json.dumps({"t": "vad", "state": "ready", "sample_rate": SR, **segmenter.vad_status}))
         # Warm the Whisper models as soon as capture starts so the user gets
         # visible progress and the first spoken segment is not the trigger for
         # an otherwise silent download.
@@ -220,6 +222,7 @@ async def stream(ws: WebSocket) -> None:
             if message["type"] == "websocket.disconnect":
                 break
             events: list[tuple[str, Any, int]] = []
+            flush_requested = False
             if message.get("bytes") is not None:
                 raw_audio = message["bytes"]
                 if not isinstance(raw_audio, (bytes, bytearray)) or not raw_audio or len(raw_audio) % 2:
@@ -263,6 +266,7 @@ async def stream(ws: WebSocket) -> None:
                         await ws.send_text(json.dumps({"t": "audio-config", "source_rate": source_sample_rate, "target_rate": SR}))
                     elif event_name == "flush":
                         events = await asyncio.to_thread(segmenter.flush)
+                        flush_requested = True
                 except (json.JSONDecodeError, TypeError, ValueError):
                     await ws.send_text(json.dumps({"t": "error", "scope": "stream", "message": "ignored malformed control message"}))
                     continue
@@ -277,6 +281,16 @@ async def stream(ws: WebSocket) -> None:
                 if event_type == "partial":
                     partial_task = task
                 task.add_done_callback(tasks.discard)
+            if flush_requested:
+                pending = tuple(tasks)
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                await ws.send_text(json.dumps({
+                    "t": "flushed",
+                    "saved": bool(session_segments),
+                    "segments": len(session_segments),
+                    "note_id": session_note_id,
+                }))
     except Exception as exc:
         # Disconnects and browser microphone shutdowns are normal session endings.
         try:

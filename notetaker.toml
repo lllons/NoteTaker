@@ -1,6 +1,7 @@
 [notetaker]
-# The web selector starts at Model 1, which preserves this current large-v3 behavior.
-# All five web profiles remain CPU-only; higher profiles widen final decoding instead of loading a larger checkpoint.
+# The web selector starts at the official large-v3 checkpoint and includes
+# additional public faster-whisper CTranslate2 models from Hugging Face.
+# Every choice is loaded explicitly on CPU with int8 weights.
 model = "large-v3"
 # Reuse the same loaded model for partials so CPU memory is not doubled.
 draft_model = "large-v3"

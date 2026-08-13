@@ -32,13 +32,15 @@ __all__ = [
 
 
 MODELS = {
+    "tiny": "Systran/faster-whisper-tiny",
     "tiny.en": "Systran/faster-whisper-tiny.en",
-    "base.en": "Systran/faster-whisper-base.en",
-    "small.en": "Systran/faster-whisper-small.en",
-    "distil-small.en": "Systran/faster-distil-whisper-small.en",
-    "medium.en": "Systran/faster-whisper-medium.en",
     "base": "Systran/faster-whisper-base",
+    "base.en": "Systran/faster-whisper-base.en",
     "small": "Systran/faster-whisper-small",
+    "small.en": "Systran/faster-whisper-small.en",
+    "medium": "Systran/faster-whisper-medium",
+    "medium.en": "Systran/faster-whisper-medium.en",
+    "distil-small.en": "Systran/faster-distil-whisper-small.en",
     "large-v3": "Systran/faster-whisper-large-v3",
     "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
     "large-v3-turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",
@@ -94,6 +96,7 @@ class TranscriptionRuntime:
             "custom",
             f"Custom · {checkpoint or 'configured model'}",
             checkpoint or "large-v3",
+            "",
             8,
             (0.0,),
             "The model configured by the command line or environment.",
@@ -237,7 +240,7 @@ class TranscriptionRuntime:
             raw_segments, info = bundle.model.transcribe(
                 audio,
                 language=self.config.language,
-                beam_size=max(1, (int(self.config.beam_size) if profile.id in {"model-1", "custom"} else profile.beam_size) if final else 2),
+                beam_size=max(1, (int(self.config.beam_size) if profile.id in {"large-v3", "custom"} else profile.beam_size) if final else 2),
                 temperature=list(profile.temperatures) if final else 0.0,
                 initial_prompt=initial_prompt or None,
                 hotwords=self.config.hotwords if final else None,

@@ -12,7 +12,11 @@ from collections import deque
 from typing import Any
 
 import numpy as np
-from faster_whisper.vad import get_vad_model
+
+try:
+    from faster_whisper.vad import get_vad_model
+except Exception:  # pragma: no cover - depends on the installed faster-whisper build
+    get_vad_model = None  # type: ignore[assignment]
 
 SR = 16_000
 FRAME = 512
@@ -49,19 +53,47 @@ def resample_audio(audio: np.ndarray, source_rate: float, target_rate: int = SR)
 
 
 class Vad:
-    """Stateful Silero VAD wrapper for 512-sample, 16 kHz frames."""
+    """CPU VAD wrapper with an energy fallback when ONNX VAD is unavailable."""
 
     def __init__(self) -> None:
-        self.s = get_vad_model().session
+        self.s = None
         self.h = np.zeros((1, 1, 128), np.float32)
         self.c = np.zeros((1, 1, 128), np.float32)
         self.ctx = np.zeros((1, 64), np.float32)
+        self.backend = "silero"
+        self.error: str | None = None
+        if get_vad_model is None:
+            self._use_fallback("faster-whisper VAD module is unavailable")
+            return
+        try:
+            self.s = get_vad_model().session
+        except Exception as exc:
+            self._use_fallback(f"{type(exc).__name__}: {str(exc)[:160]}")
+
+    def _use_fallback(self, reason: str) -> None:
+        self.s = None
+        self.backend = "energy-fallback"
+        self.error = reason
+
+    @staticmethod
+    def _energy_probability(frame: np.ndarray) -> float:
+        level = float(np.sqrt(np.mean(frame * frame))) if len(frame) else 0.0
+        # This is deliberately conservative: Segmenter also keeps a noise
+        # floor and a separate energy hint, so the fallback cannot silently
+        # discard audio when Silero/onnxruntime is missing.
+        return max(0.01, min(0.99, (level - 0.004) / 0.017))
 
     def __call__(self, frame: np.ndarray) -> float:
-        x = np.concatenate([self.ctx, frame.reshape(1, -1)], 1)
-        out, self.h, self.c = self.s.run(None, {"input": x, "h": self.h, "c": self.c})
-        self.ctx = frame[-64:].reshape(1, -1).copy()
-        return float(out[0])
+        if self.s is None:
+            return self._energy_probability(frame)
+        try:
+            x = np.concatenate([self.ctx, frame.reshape(1, -1)], 1)
+            out, self.h, self.c = self.s.run(None, {"input": x, "h": self.h, "c": self.c})
+            self.ctx = frame[-64:].reshape(1, -1).copy()
+            return float(out[0])
+        except Exception as exc:
+            self._use_fallback(f"{type(exc).__name__}: {str(exc)[:160]}")
+            return self._energy_probability(frame)
 
 
 class Segmenter:
@@ -108,6 +140,14 @@ class Segmenter:
         )
         self.vad_on = max(0.05, min(0.99, float(getattr(config, "vad_on_threshold", DEFAULT_VAD_ON)) if config else DEFAULT_VAD_ON))
         self.vad_off = max(0.02, min(self.vad_on - 0.01, float(getattr(config, "vad_off_threshold", DEFAULT_VAD_OFF)) if config else DEFAULT_VAD_OFF))
+
+    @property
+    def vad_status(self) -> dict[str, Any]:
+        return {
+            "backend": self.vad.backend,
+            "fallback": self.vad.backend != "silero",
+            "error": self.vad.error,
+        }
 
     def feed(self, x: np.ndarray) -> list[tuple[str, np.ndarray, int]]:
         events: list[tuple[str, np.ndarray, int]] = []

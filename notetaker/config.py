@@ -10,18 +10,12 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ModelProfile:
-    """A selectable CPU decoding profile for the web capture screen.
-
-    ``large-v3`` is already the largest standard Whisper checkpoint used by
-    this application. The higher profiles therefore spend more CPU time on
-    beam search and fallback passes rather than claiming a nonexistent larger
-    checkpoint. Keeping the checkpoint in the profile leaves room for adding
-    another CPU-compatible model later without changing the WebSocket API.
-    """
+    """A public Hugging Face/CTranslate2 model choice for CPU transcription."""
 
     id: str
     label: str
     checkpoint: str
+    repository: str
     beam_size: int
     temperatures: tuple[float, ...]
     description: str
@@ -33,6 +27,7 @@ class ModelProfile:
             "id": self.id,
             "label": self.label,
             "checkpoint": self.checkpoint,
+            "repository": self.repository,
             "beam_size": self.beam_size,
             "temperature_passes": list(self.temperatures),
             "description": self.description,
@@ -43,60 +38,25 @@ class ModelProfile:
         }
 
 
+# These are public CTranslate2 repositories that faster-whisper can load
+# directly. The selector keeps the largest general model first, then offers
+# real multilingual, English-only, distilled, turbo, and smaller fallbacks.
 MODEL_PROFILES: tuple[ModelProfile, ...] = (
-    ModelProfile(
-        "model-1",
-        "Model 1 · Current",
-        "large-v3",
-        8,
-        (0.0,),
-        "The current large-v3 behavior with the existing accuracy settings.",
-        "slow",
-        "high",
-    ),
-    ModelProfile(
-        "model-2",
-        "Model 2 · Careful",
-        "large-v3",
-        10,
-        (0.0,),
-        "A wider beam for fewer uncertain word choices at a modest CPU cost.",
-        "slower",
-        "higher",
-    ),
-    ModelProfile(
-        "model-3",
-        "Model 3 · High accuracy",
-        "large-v3",
-        12,
-        (0.0, 0.15),
-        "High-accuracy decoding with one conservative fallback pass.",
-        "slower",
-        "very high",
-    ),
-    ModelProfile(
-        "model-4",
-        "Model 4 · Deep accuracy",
-        "large-v3",
-        16,
-        (0.0, 0.15, 0.3),
-        "Deep CPU decoding for difficult speech, accents, and noisy recordings.",
-        "very slow",
-        "very high",
-    ),
-    ModelProfile(
-        "model-5",
-        "Model 5 · Maximum CPU accuracy",
-        "large-v3",
-        20,
-        (0.0, 0.15, 0.3, 0.5),
-        "The most thorough option: maximum beam width and fallback passes on CPU.",
-        "slowest",
-        "maximum",
-    ),
+    ModelProfile("large-v3", "Large-v3 · Best overall", "large-v3", "https://huggingface.co/Systran/faster-whisper-large-v3", 8, (0.0,), "Official large-v3 conversion; strongest general-purpose option for preserving names, numbers, and technical speech.", "slowest", "best"),
+    ModelProfile("large-v3-max", "Large-v3 · Maximum CPU decode", "large-v3", "https://huggingface.co/Systran/faster-whisper-large-v3", 20, (0.0, 0.15, 0.3, 0.5), "The same best checkpoint with the widest beam and fallback passes; use when latency does not matter.", "extreme", "maximum"),
+    ModelProfile("distil-large-v3", "Distil-large-v3 · High quality", "distil-large-v3", "https://huggingface.co/Systran/faster-distil-whisper-large-v3", 8, (0.0,), "Large distilled Whisper checkpoint designed for faster-whisper; faster and lighter with a quality trade-off.", "slow", "very high"),
+    ModelProfile("large-v3-turbo", "Large-v3 Turbo · Faster", "large-v3-turbo", "https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2", 5, (0.0,), "Large-v3 Turbo CTranslate2 conversion; a practical speed choice when large-v3 is too slow.", "fast", "high"),
+    ModelProfile("medium", "Medium · Multilingual", "medium", "https://huggingface.co/Systran/faster-whisper-medium", 8, (0.0,), "Official multilingual medium checkpoint for lower memory use while retaining broad language coverage.", "slow", "high"),
+    ModelProfile("medium.en", "Medium English", "medium.en", "https://huggingface.co/Systran/faster-whisper-medium.en", 8, (0.0,), "English-only medium checkpoint; a strong CPU choice for clear English recordings.", "slow", "high"),
+    ModelProfile("small", "Small · Multilingual", "small", "https://huggingface.co/Systran/faster-whisper-small", 8, (0.0,), "Official multilingual small checkpoint for a much lighter CPU footprint.", "medium", "good"),
+    ModelProfile("small.en", "Small English", "small.en", "https://huggingface.co/Systran/faster-whisper-small.en", 8, (0.0,), "English-only small checkpoint for faster local capture.", "medium", "good"),
+    ModelProfile("base", "Base · Multilingual", "base", "https://huggingface.co/Systran/faster-whisper-base", 8, (0.0,), "Lightweight multilingual fallback for machines that cannot hold a large model.", "fast", "moderate"),
+    ModelProfile("base.en", "Base English", "base.en", "https://huggingface.co/Systran/faster-whisper-base.en", 8, (0.0,), "Lightweight English-only fallback.", "fast", "moderate"),
+    ModelProfile("tiny", "Tiny · Multilingual", "tiny", "https://huggingface.co/Systran/faster-whisper-tiny", 8, (0.0,), "Smallest multilingual checkpoint; use only when CPU memory is severely constrained.", "fastest", "basic"),
+    ModelProfile("tiny.en", "Tiny English", "tiny.en", "https://huggingface.co/Systran/faster-whisper-tiny.en", 8, (0.0,), "Smallest English-only checkpoint; not recommended when retaining every detail matters.", "fastest", "basic"),
 )
 MODEL_PROFILE_BY_ID = {profile.id: profile for profile in MODEL_PROFILES}
-DEFAULT_MODEL_PROFILE_ID = "model-1"
+DEFAULT_MODEL_PROFILE_ID = "large-v3"
 
 try:
     import tomllib

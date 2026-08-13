@@ -1,4 +1,5 @@
 faster-whisper
+onnxruntime
 fastapi
 uvicorn[standard]
 numpy
