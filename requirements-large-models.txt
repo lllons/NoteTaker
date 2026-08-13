@@ -1,0 +1,6 @@
+-r requirements.txt
+# Optional larger CPU model backends used by the web selector.
+torch
+transformers>=5.13.0
+soundfile
+mistral-common

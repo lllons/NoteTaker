@@ -59,6 +59,14 @@ The requirements are intentionally small:
 - `uvicorn[standard]` — ASGI server.
 - `numpy` — PCM audio conversion and signal handling.
 
+The default install keeps the lightweight faster-whisper CPU path. The three larger 1.7B–7B choices use an optional Transformers backend because they are different audio-language architectures:
+
+```bash
+python -m pip install -r requirements-large-models.txt
+```
+
+This installs PyTorch, Transformers, SoundFile, and Mistral support. The app still forces these models to CPU; the larger models use float32 weights and can require tens of gigabytes of RAM.
+
 ### 4. Start NoteTaker
 
 Run the compatibility entrypoint from the repository root:
@@ -158,20 +166,23 @@ Once `.venv` is activated, use `python` for the remaining commands on every plat
 
 ## Choosing a transcription model
 
-The web selector now lists real public Hugging Face repositories that can be loaded directly by `faster-whisper`/CTranslate2. Every choice is forced to `device="cpu"` with `compute_type="int8"`; larger choices may be very slow but preserve more detail than the small fallbacks.
+The web selector lists public Hugging Face checkpoints across two local CPU backends. The original faster-whisper choices use CTranslate2 `int8`; the three larger audio-language models use Transformers `float32`. None of them use a GPU or an external API.
 
-| Choice | Hugging Face checkpoint | Best use |
-| --- | --- | --- |
-| **Large-v3 · Best overall** | `Systran/faster-whisper-large-v3` | Best general accuracy; recommended default |
-| **Large-v3 · Maximum CPU decode** | `Systran/faster-whisper-large-v3` | Same weights with beam 20 and fallback passes |
-| **Distil-large-v3 · High quality** | `Systran/faster-distil-whisper-large-v3` | Large distilled model with lower CPU cost |
-| **Large-v3 Turbo · Faster** | `deepdml/faster-whisper-large-v3-turbo-ct2` | Faster large-model capture with a quality trade-off |
-| **Medium / Medium English** | `Systran/faster-whisper-medium(.en)` | Strong lower-memory multilingual or English capture |
-| **Small / Small English** | `Systran/faster-whisper-small(.en)` | Moderate CPU fallback |
-| **Base / Base English** | `Systran/faster-whisper-base(.en)` | Lightweight fallback |
-| **Tiny / Tiny English** | `Systran/faster-whisper-tiny(.en)` | Only for severely constrained machines |
+| Choice | Size / backend | Hugging Face checkpoint | Best use |
+| --- | --- | --- | --- |
+| **Large-v3 · Best overall** | 1.55B · CTranslate2 int8 | `Systran/faster-whisper-large-v3` | Best general Whisper accuracy; recommended default |
+| **Large-v3 · Maximum CPU decode** | 1.55B · CTranslate2 int8 | `Systran/faster-whisper-large-v3` | Same weights with beam 20 and fallback passes |
+| **Qwen3-ASR · 1.7B · Multilingual** | 1.7B · Transformers float32 | `Qwen/Qwen3-ASR-1.7B-hf` | Dedicated high-accuracy multilingual ASR |
+| **Voxtral Mini · 3B · Transcription** | 3B · Transformers float32 | `mistralai/Voxtral-Mini-3B-2507` | Dedicated long-form transcription mode |
+| **Qwen2-Audio · 7B · Deep audio** | 7B · Transformers float32 | `Qwen/Qwen2-Audio-7B-Instruct` | Largest audio-language option for difficult recordings |
+| **Distil-large-v3 · High quality** | 756M · CTranslate2 int8 | `Systran/faster-distil-whisper-large-v3` | Large distilled model with lower CPU cost |
+| **Large-v3 Turbo · Faster** | 809M · CTranslate2 int8 | `deepdml/faster-whisper-large-v3-turbo-ct2` | Faster large-model capture with a quality trade-off |
+| **Medium / Medium English** | 769M · CTranslate2 int8 | `Systran/faster-whisper-medium(.en)` | Strong lower-memory multilingual or English capture |
+| **Small / Small English** | 244M · CTranslate2 int8 | `Systran/faster-whisper-small(.en)` | Moderate CPU fallback |
+| **Base / Base English** | 74M · CTranslate2 int8 | `Systran/faster-whisper-base(.en)` | Lightweight fallback |
+| **Tiny / Tiny English** | 39M · CTranslate2 int8 | `Systran/faster-whisper-tiny(.en)` | Only for severely constrained machines |
 
-The selector is disabled while capture is active. Changing it applies to the next WebSocket session; switching between different checkpoints releases the old model before loading the new one so CPU memory is not needlessly doubled. Public model repositories do not require an API key. The raw `openai/whisper-large-v3` Transformers repository is not listed because the current application expects a CTranslate2 conversion; the official `Systran` conversion is the compatible choice.
+The selector is disabled while capture is active. Changing it applies to the next WebSocket session; switching checkpoints releases the old model before loading the new one. The three larger choices require `python -m pip install -r requirements-large-models.txt`; their public repositories do not require an API key. They return a timestamped transcript segment but do not currently provide Whisper-style word timestamps. The raw `openai/whisper-large-v3` repository is not listed because the default path expects a CTranslate2 conversion.
 
 The checked-in defaults in `notetaker.toml` remain:
 
@@ -206,7 +217,7 @@ Useful guidance:
 
 - Set `--threads` to a positive CPU thread count when you need to constrain resource usage. `0` lets the runtime choose.
 
-Models are cached by faster-whisper after their first download. Check the model status pill and terminal if a large checkpoint is still downloading or initializing.
+Models are cached locally after their first download. Check the model status pill and terminal if a large checkpoint is still downloading or initializing. The Transformers models can consume roughly 7–30+ GB of RAM in float32 depending on the checkpoint, so close other memory-heavy applications before selecting them.
 
 ## Configuration
 
@@ -332,7 +343,8 @@ tests/test_knowledge.py      offline knowledge-pipeline tests
 tests/test_model_profiles.py offline CPU model-selector tests
 notes/notes.md               developer guide and operational notes
 notetaker.toml               checked-in runtime defaults
-requirements.txt             Python dependencies
+requirements.txt             lightweight Python dependencies
+requirements-large-models.txt optional Transformers/PyTorch CPU model dependencies
 data/knowledge.sqlite3       created on first run
 ```
 
@@ -373,7 +385,8 @@ The second form remains auditable: extracted items can be traced to source segme
 
 - The first VAD/model load and download are the most expensive startup steps; later sessions reuse cached weights.
 - Large-v3 runs on CPU with int8 weights; expect high memory use and slower-than-real-time decoding on many machines.
-- The selector exposes actual Hugging Face CTranslate2 checkpoints plus a maximum-decode large-v3 profile; only one checkpoint is kept loaded at a time.
+- The selector exposes actual Hugging Face CTranslate2 checkpoints plus Qwen3-ASR 1.7B, Voxtral Mini 3B, and Qwen2-Audio 7B Transformers backends; only one checkpoint is kept loaded at a time.
+- The Transformers choices are explicitly CPU float32 rather than CTranslate2 int8, because these architectures are not faster-whisper checkpoints. Their optional dependencies are intentionally separate from the lightweight default install.
 - The draft path uses a small beam on the selected model, and stale partial work is dropped so a slow CPU cannot delay final utterances.
 - Model inference uses bounded worker execution so concurrent transcription does not corrupt model state.
 - Each capture receives a unique note ID and the browser waits for a final `flushed` confirmation before declaring the note saved.
@@ -408,7 +421,7 @@ Run `python -m pip install -r requirements.txt` again so `onnxruntime` is instal
 
 ### The first run is slow or appears idle
 
-The server prints its local URL immediately, then the selected model and CPU VAD initialize when you press **Start capture**. Check the model/VAD status pill, the final `flushed` message, and the terminal. The first large-v3 download can take a while.
+The server prints its local URL immediately, then the selected model and CPU VAD initialize when you press **Start capture**. Check the model/VAD status pill, the final `flushed` message, and the terminal. The first large-v3 download can take a while; if a 1.7B, 3B, or 7B choice reports missing optional dependencies, install `requirements-large-models.txt` and retry.
 
 ### Transcription quality is poor
 

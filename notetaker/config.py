@@ -10,7 +10,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ModelProfile:
-    """A public Hugging Face/CTranslate2 model choice for CPU transcription."""
+    """A public Hugging Face model choice and CPU backend for transcription."""
 
     id: str
     label: str
@@ -21,6 +21,10 @@ class ModelProfile:
     description: str
     speed: str
     quality: str
+    backend: str = "faster-whisper"
+    parameters: str = ""
+    compute_type: str = "int8"
+    optional_requirements: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -33,17 +37,25 @@ class ModelProfile:
             "description": self.description,
             "speed": self.speed,
             "quality": self.quality,
+            "backend": self.backend,
+            "parameters": self.parameters,
+            "optional_requirements": self.optional_requirements,
             "device": "cpu",
-            "compute_type": "int8",
+            "compute_type": self.compute_type,
         }
 
 
-# These are public CTranslate2 repositories that faster-whisper can load
-# directly. The selector keeps the largest general model first, then offers
-# real multilingual, English-only, distilled, turbo, and smaller fallbacks.
+# These are public Hugging Face checkpoints. The original entries are
+# CTranslate2 repositories that faster-whisper loads directly; the three
+# larger entries use the optional Transformers audio backend and still force
+# CPU inference. Keeping the backend in profile metadata prevents the web
+# selector from advertising a checkpoint the loader cannot actually use.
 MODEL_PROFILES: tuple[ModelProfile, ...] = (
     ModelProfile("large-v3", "Large-v3 · Best overall", "large-v3", "https://huggingface.co/Systran/faster-whisper-large-v3", 8, (0.0,), "Official large-v3 conversion; strongest general-purpose option for preserving names, numbers, and technical speech.", "slowest", "best"),
     ModelProfile("large-v3-max", "Large-v3 · Maximum CPU decode", "large-v3", "https://huggingface.co/Systran/faster-whisper-large-v3", 20, (0.0, 0.15, 0.3, 0.5), "The same best checkpoint with the widest beam and fallback passes; use when latency does not matter.", "extreme", "maximum"),
+    ModelProfile("qwen3-asr-1.7b", "Qwen3-ASR · 1.7B · Multilingual", "Qwen/Qwen3-ASR-1.7B-hf", "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf", 1, (0.0,), "Dedicated multilingual ASR model with strong recognition of accents, technical speech, and long recordings.", "very slow", "excellent", backend="transformers-qwen3-asr", parameters="1.7B", compute_type="float32", optional_requirements="requirements-large-models.txt"),
+    ModelProfile("voxtral-mini-3b", "Voxtral Mini · 3B · Transcription", "mistralai/Voxtral-Mini-3B-2507", "https://huggingface.co/mistralai/Voxtral-Mini-3B-2507", 1, (0.0,), "A 3B audio-language model with a dedicated transcription mode and long-form audio support.", "extreme", "very high", backend="transformers-voxtral", parameters="3B", compute_type="float32", optional_requirements="requirements-large-models.txt"),
+    ModelProfile("qwen2-audio-7b", "Qwen2-Audio · 7B · Deep audio", "Qwen/Qwen2-Audio-7B-Instruct", "https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct", 1, (0.0,), "A 7B audio-language model prompted for verbatim speech transcription; best reserved for machines with substantial RAM.", "extreme", "very high", backend="transformers-qwen2-audio", parameters="7B", compute_type="float32", optional_requirements="requirements-large-models.txt"),
     ModelProfile("distil-large-v3", "Distil-large-v3 · High quality", "distil-large-v3", "https://huggingface.co/Systran/faster-distil-whisper-large-v3", 8, (0.0,), "Large distilled Whisper checkpoint designed for faster-whisper; faster and lighter with a quality trade-off.", "slow", "very high"),
     ModelProfile("large-v3-turbo", "Large-v3 Turbo · Faster", "large-v3-turbo", "https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2", 5, (0.0,), "Large-v3 Turbo CTranslate2 conversion; a practical speed choice when large-v3 is too slow.", "fast", "high"),
     ModelProfile("medium", "Medium · Multilingual", "medium", "https://huggingface.co/Systran/faster-whisper-medium", 8, (0.0,), "Official multilingual medium checkpoint for lower memory use while retaining broad language coverage.", "slow", "high"),

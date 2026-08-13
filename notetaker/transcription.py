@@ -54,6 +54,119 @@ class ModelBundle:
     executor: ThreadPoolExecutor
 
 
+def _language_hint(language: str | None) -> str | None:
+    """Return a language value accepted by the larger Transformers ASR models."""
+    if not language:
+        return None
+    names = {
+        "ar": "Arabic", "de": "German", "en": "English", "es": "Spanish",
+        "fr": "French", "hi": "Hindi", "it": "Italian", "ja": "Japanese",
+        "ko": "Korean", "nl": "Dutch", "pt": "Portuguese", "ru": "Russian",
+        "th": "Thai", "tr": "Turkish", "vi": "Vietnamese", "zh": "Chinese",
+    }
+    return names.get(language.casefold(), language)
+
+
+def _move_inputs_to_cpu(inputs: Any, torch: Any) -> Any:
+    """Move a Transformers BatchFeature to CPU while preserving integer IDs."""
+    try:
+        return inputs.to("cpu", dtype=torch.float32)
+    except (AttributeError, TypeError):
+        if hasattr(inputs, "items"):
+            for key, value in inputs.items():
+                if not hasattr(value, "to"):
+                    continue
+                if hasattr(value, "is_floating_point") and value.is_floating_point():
+                    inputs[key] = value.to(device="cpu", dtype=torch.float32)
+                else:
+                    inputs[key] = value.to(device="cpu")
+        return inputs
+
+
+def _load_cpu_transformers_model(model_class: Any, checkpoint: str, torch: Any) -> Any:
+    """Load a Transformers model without device-map or GPU assumptions."""
+    try:
+        model = model_class.from_pretrained(checkpoint, dtype=torch.float32)
+    except TypeError:
+        # Older Transformers releases use torch_dtype instead of dtype.
+        model = model_class.from_pretrained(checkpoint, torch_dtype=torch.float32)
+    return model.to("cpu").eval()
+
+
+class _Qwen3ASRAdapter:
+    def __init__(self, model: Any, processor: Any, torch: Any) -> None:
+        self.model = model
+        self.processor = processor
+        self.torch = torch
+
+    def transcribe(self, audio: np.ndarray, language: str | None, prompt: str) -> tuple[str, str | None]:
+        kwargs: dict[str, Any] = {"audio": audio, "sampling_rate": SR}
+        if language:
+            kwargs["language"] = _language_hint(language)
+        if prompt:
+            kwargs["prompt"] = prompt
+        inputs = self.processor.apply_transcription_request(**kwargs)
+        inputs = _move_inputs_to_cpu(inputs, self.torch)
+        with self.torch.inference_mode():
+            output_ids = self.model.generate(**inputs, max_new_tokens=1024, do_sample=False)
+        generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+        parsed = self.processor.decode(generated_ids, return_format="parsed")[0]
+        if isinstance(parsed, dict):
+            return str(parsed.get("transcription", "") or "").strip(), parsed.get("language")
+        return self.processor.decode(generated_ids, return_format="transcription_only")[0].strip(), language
+
+
+class _VoxtralAdapter:
+    def __init__(self, model: Any, processor: Any, torch: Any, checkpoint: str) -> None:
+        self.model = model
+        self.processor = processor
+        self.torch = torch
+        self.checkpoint = checkpoint
+
+    def transcribe(self, audio: np.ndarray, language: str | None, prompt: str) -> tuple[str, str | None]:
+        inputs = self.processor.apply_transcription_request(
+            audio=audio,
+            sampling_rate=SR,
+            format="WAV",
+            model_id=self.checkpoint,
+            language=_language_hint(language),
+        )
+        inputs = _move_inputs_to_cpu(inputs, self.torch)
+        with self.torch.inference_mode():
+            output_ids = self.model.generate(**inputs, max_new_tokens=1024, do_sample=False)
+        generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+        text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        return text, language
+
+
+class _Qwen2AudioAdapter:
+    def __init__(self, model: Any, processor: Any, torch: Any) -> None:
+        self.model = model
+        self.processor = processor
+        self.torch = torch
+
+    def transcribe(self, audio: np.ndarray, language: str | None, prompt: str) -> tuple[str, str | None]:
+        conversation = [{
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio_url": "local-audio"},
+                {"type": "text", "text": prompt or "Transcribe this audio verbatim. Return only the spoken words."},
+            ],
+        }]
+        text = self.processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+        inputs = self.processor(text=text, audios=[audio], sampling_rate=SR, return_tensors="pt", padding=True)
+        inputs = _move_inputs_to_cpu(inputs, self.torch)
+        with self.torch.inference_mode():
+            output_ids = self.model.generate(**inputs, max_new_tokens=1024, do_sample=False)
+        generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+        response = self.processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0].strip()
+        return response, language
+
+
 class SpeakerLabeler:
     """Speaker metadata adapter.
 
@@ -84,10 +197,15 @@ class TranscriptionRuntime:
         self._loaded_draft_checkpoint: str | None = None
         configured_model = str(getattr(config, "model", "") or "")
         self._profile = next(
-            (profile for profile in MODEL_PROFILES if profile.checkpoint == configured_model),
+            (profile for profile in MODEL_PROFILES if profile.id == configured_model or profile.checkpoint == configured_model),
             self._custom_profile(configured_model),
         )
         self._draft_checkpoint = str(getattr(config, "draft_model", configured_model) or configured_model)
+        # A command-line/environment model override should not silently load a
+        # second large Whisper checkpoint as the draft model. The web selector
+        # already applies this rule in select_model(); mirror it for CLI use.
+        if self._profile.backend != "faster-whisper" and self._draft_checkpoint == "large-v3":
+            self._draft_checkpoint = self._profile.checkpoint
         self.speakers = SpeakerLabeler(config.diarization)
 
     @staticmethod
@@ -105,7 +223,7 @@ class TranscriptionRuntime:
         )
 
     def model_options(self) -> list[dict[str, Any]]:
-        """Return the five safe web choices without exposing model internals."""
+        """Return the CPU model catalog used by the web selector."""
         return [profile.to_dict() for profile in MODEL_PROFILES]
 
     def select_model(self, profile_id: str) -> dict[str, Any]:
@@ -143,14 +261,56 @@ class TranscriptionRuntime:
         except TypeError:  # pragma: no cover - Python 3.8 compatibility
             bundle.executor.shutdown(wait=False)
 
-    def _load(self, name: str) -> ModelBundle:
-        repo = MODELS.get(name, name)
-        model = WhisperModel(
-            repo,
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=max(0, int(self.config.threads)),
+    def _profile_for_checkpoint(self, checkpoint: str) -> ModelProfile | None:
+        return next(
+            (profile for profile in MODEL_PROFILES if profile.id == checkpoint or profile.checkpoint == checkpoint),
+            None,
         )
+
+    def _load_transformers(self, profile: ModelProfile) -> Any:
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError(
+                f"{profile.label} requires the optional CPU model dependencies. "
+                f"Install with `python -m pip install -r {profile.optional_requirements or 'requirements-large-models.txt'}`."
+            ) from exc
+        if int(self.config.threads) > 0:
+            torch.set_num_threads(int(self.config.threads))
+        try:
+            from transformers import AutoProcessor
+            processor = AutoProcessor.from_pretrained(profile.checkpoint)
+            if profile.backend == "transformers-qwen3-asr":
+                from transformers import AutoModelForMultimodalLM
+                model = _load_cpu_transformers_model(AutoModelForMultimodalLM, profile.checkpoint, torch)
+                return _Qwen3ASRAdapter(model, processor, torch)
+            if profile.backend == "transformers-voxtral":
+                from transformers import VoxtralForConditionalGeneration
+                model = _load_cpu_transformers_model(VoxtralForConditionalGeneration, profile.checkpoint, torch)
+                return _VoxtralAdapter(model, processor, torch, profile.checkpoint)
+            if profile.backend == "transformers-qwen2-audio":
+                from transformers import Qwen2AudioForConditionalGeneration
+                model = _load_cpu_transformers_model(Qwen2AudioForConditionalGeneration, profile.checkpoint, torch)
+                return _Qwen2AudioAdapter(model, processor, torch)
+        except ImportError as exc:
+            raise RuntimeError(
+                f"{profile.label} requires Transformers audio support. "
+                f"Install with `python -m pip install -r {profile.optional_requirements or 'requirements-large-models.txt'}`."
+            ) from exc
+        raise RuntimeError(f"Unsupported model backend: {profile.backend}")
+
+    def _load(self, name: str, profile: ModelProfile | None = None) -> ModelBundle:
+        profile = profile or self._profile_for_checkpoint(name)
+        if profile is not None and profile.backend != "faster-whisper":
+            model = self._load_transformers(profile)
+        else:
+            repo = MODELS.get(name, name)
+            model = WhisperModel(
+                repo,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=max(0, int(self.config.threads)),
+            )
         return ModelBundle(model, threading.Lock(), ThreadPoolExecutor(max_workers=1))
 
     def status(self) -> dict[str, Any]:
@@ -172,7 +332,8 @@ class TranscriptionRuntime:
                 },
                 "loaded": loaded,
                 "device": "cpu",
-                "compute_type": "int8",
+                "compute_type": profile.compute_type,
+                "backend": profile.backend,
                 "error": self._model_error,
             }
 
@@ -192,9 +353,10 @@ class TranscriptionRuntime:
             self._model_error = None
             try:
                 if self.final is None:
-                    self.final = self._load(target_checkpoint)
+                    self.final = self._load(target_checkpoint, self._profile)
                 if self.draft is None:
-                    self.draft = self.final if target_draft == target_checkpoint else self._load(target_draft)
+                    draft_profile = self._profile_for_checkpoint(target_draft)
+                    self.draft = self.final if target_draft == target_checkpoint else self._load(target_draft, draft_profile)
                 self._loaded_checkpoint = target_checkpoint
                 self._loaded_draft_checkpoint = target_draft
                 self._model_state = "ready"
@@ -236,6 +398,24 @@ class TranscriptionRuntime:
             context[-self.config.context_chars:],
         ]
         initial_prompt = " ".join(part for part in prompt_parts if part).strip()
+        if profile.backend != "faster-whisper":
+            with bundle.lock:
+                external_text, external_language = bundle.model.transcribe(audio, self.config.language, initial_prompt)
+            if not external_text:
+                return [], external_language or self.config.language
+            segment_id = f"seg-{int(offset * 1000):09d}-external"
+            speaker, speaker_confidence = self.speakers.label(segment_id)
+            return [TranscriptSegment(
+                id=segment_id,
+                start=offset,
+                end=offset + len(audio) / SR,
+                text=external_text,
+                confidence=0.82,
+                speaker=speaker,
+                speaker_confidence=speaker_confidence,
+                language=external_language or self.config.language,
+            )], external_language or self.config.language
+
         with bundle.lock:
             raw_segments, info = bundle.model.transcribe(
                 audio,

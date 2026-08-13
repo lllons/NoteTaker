@@ -58,7 +58,7 @@ def models() -> dict[str, Any]:
         "selected": status["profile_id"],
         "models": runtime.model_options(),
         "device": "cpu",
-        "compute_type": "int8",
+        "compute_type": status["compute_type"],
     }
 
 

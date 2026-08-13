@@ -1,7 +1,9 @@
 [notetaker]
 # The web selector starts at the official large-v3 checkpoint and includes
 # additional public faster-whisper CTranslate2 models from Hugging Face.
-# Every choice is loaded explicitly on CPU with int8 weights.
+# faster-whisper choices load on CPU with int8 weights. The three larger
+# Transformers choices use CPU float32 and are installed from the optional
+# requirements-large-models.txt file.
 model = "large-v3"
 # Reuse the same loaded model for partials so CPU memory is not doubled.
 draft_model = "large-v3"
