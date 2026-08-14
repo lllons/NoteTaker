@@ -1,5 +1,6 @@
-faster-whisper
+faster-whisper==1.2.1
 onnxruntime
 fastapi
 uvicorn[standard]
 numpy
+scipy

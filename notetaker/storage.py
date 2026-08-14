@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import unicodedata
@@ -10,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from .models import KnowledgeNote
+
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA = """
@@ -55,6 +59,7 @@ class KnowledgeStore:
                  json.dumps(body, ensure_ascii=False), search_text),
             )
             db.commit()
+        logger.info("note save note_id=%s segment_count=%d", note.id, len(note.transcript))
 
     def get(self, note_id: str) -> dict[str, Any] | None:
         with self._connect() as db:
@@ -109,8 +114,9 @@ class KnowledgeStore:
         with self._connect() as db:
             rows = db.execute("SELECT id,title,created_at,source_type,language,duration,body_json,search_text FROM notes").fetchall()
         ranked: list[tuple[float, dict[str, Any]]] = []
+        needs_body = timestamp is not None or "action" in filters or "question" in filters
         for row in rows:
-            body = json.loads(row["body_json"])
+            body = json.loads(row["body_json"]) if needs_body else None
             normalized = row["search_text"]
             score = 0.0
             if phrase and phrase in normalized:
@@ -121,7 +127,7 @@ class KnowledgeStore:
                     score += min(occurrences, 12) * 2.0
                     if term in self._normalize(row["title"]):
                         score += 8.0
-            if timestamp is not None and any(
+            if timestamp is not None and body is not None and any(
                 float(segment.get("start", 0)) <= timestamp <= float(segment.get("end", 0))
                 for segment in body.get("transcript", [])
             ):
@@ -130,9 +136,9 @@ class KnowledgeStore:
                 continue
             if filters.get("person") and filters["person"].casefold() not in normalized:
                 continue
-            if filters.get("action") and filters["action"].casefold() not in self._normalize(json.dumps(body.get("action_items", []))):
+            if filters.get("action") and body is not None and filters["action"].casefold() not in self._normalize(json.dumps(body.get("action_items", []))):
                 continue
-            if filters.get("question") and filters["question"].casefold() not in self._normalize(json.dumps(body.get("open_questions", []))):
+            if filters.get("question") and body is not None and filters["question"].casefold() not in self._normalize(json.dumps(body.get("open_questions", []))):
                 continue
             if filters.get("speaker") and filters["speaker"].casefold() not in normalized:
                 continue

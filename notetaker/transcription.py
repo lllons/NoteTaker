@@ -2,19 +2,25 @@
 
 Audio intake and utterance boundaries live in :mod:`listening.audio`; this module
 owns Whisper model loading, decoding, confidence metadata, and fragment merging.
-The default is the full large-v3 model with CPU int8 inference because recall is
-more important than real-time latency for this application.
+The live default is large-v3 Turbo with CPU int8 inference and a dedicated tiny.en
+draft model; large-v3 remains available for offline-quality transcription.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from faster_whisper import WhisperModel
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:  # pragma: no cover - offline tests can exercise prompting without model downloads
+    WhisperModel = None  # type: ignore[assignment]
 
 from listening.audio import SR, Segmenter, Vad, resample_audio
 from .config import MODEL_PROFILE_BY_ID, MODEL_PROFILES, ModelProfile
@@ -29,6 +35,9 @@ __all__ = [
     "Vad",
     "resample_audio",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 MODELS = {
@@ -146,13 +155,10 @@ class _Qwen2AudioAdapter:
         self.torch = torch
 
     def transcribe(self, audio: np.ndarray, language: str | None, prompt: str) -> tuple[str, str | None]:
-        conversation = [{
-            "role": "user",
-            "content": [
-                {"type": "audio", "audio_url": "local-audio"},
-                {"type": "text", "text": prompt or "Transcribe this audio verbatim. Return only the spoken words."},
-            ],
-        }]
+        content: list[dict[str, str]] = [{"type": "audio", "audio_url": "local-audio"}]
+        if prompt:
+            content.append({"type": "text", "text": prompt})
+        conversation = [{"role": "user", "content": content}]
         text = self.processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
         inputs = self.processor(text=text, audios=[audio], sampling_rate=SR, return_tensors="pt", padding=True)
         inputs = _move_inputs_to_cpu(inputs, self.torch)
@@ -191,21 +197,23 @@ class TranscriptionRuntime:
         self.final: ModelBundle | None = None
         self.draft: ModelBundle | None = None
         self._load_lock = threading.Lock()
+        # status() only takes this short state lock; it never waits for model
+        # download or initialization on the ASGI event loop.
+        self._state_lock = threading.Lock()
         self._model_state = "not-loaded"
         self._model_error: str | None = None
         self._loaded_checkpoint: str | None = None
         self._loaded_draft_checkpoint: str | None = None
+        self._benchmark: dict[str, Any] | None = None
+        self._last_decode: dict[str, Any] = {}
+        self._decode_lock = threading.Lock()
         configured_model = str(getattr(config, "model", "") or "")
         self._profile = next(
             (profile for profile in MODEL_PROFILES if profile.id == configured_model or profile.checkpoint == configured_model),
             self._custom_profile(configured_model),
         )
-        self._draft_checkpoint = str(getattr(config, "draft_model", configured_model) or configured_model)
-        # A command-line/environment model override should not silently load a
-        # second large Whisper checkpoint as the draft model. The web selector
-        # already applies this rule in select_model(); mirror it for CLI use.
-        if self._profile.backend != "faster-whisper" and self._draft_checkpoint == "large-v3":
-            self._draft_checkpoint = self._profile.checkpoint
+        self._draft_checkpoint = str(getattr(config, "draft_model", "tiny.en") or "tiny.en")
+        self._configured_draft_checkpoint = self._draft_checkpoint
         self.speakers = SpeakerLabeler(config.diarization)
 
     @staticmethod
@@ -236,7 +244,7 @@ class TranscriptionRuntime:
                 self._loaded_checkpoint is not None
                 and (
                     self._loaded_checkpoint != profile.checkpoint
-                    or self._loaded_draft_checkpoint != profile.checkpoint
+                    or self._loaded_draft_checkpoint != self._configured_draft_checkpoint
                 )
             )
             if checkpoint_changed:
@@ -247,9 +255,13 @@ class TranscriptionRuntime:
                 self._loaded_checkpoint = None
                 self._loaded_draft_checkpoint = None
             self._profile = profile
-            self._draft_checkpoint = profile.checkpoint
-            self._model_error = None
-            self._model_state = "ready" if self.final is not None and self.draft is not None else "not-loaded"
+            # Keep a dedicated small draft checkpoint for every selected final
+            # model. The two bundles are intentionally never shared.
+            self._draft_checkpoint = self._configured_draft_checkpoint
+            self._benchmark = None
+            with self._state_lock:
+                self._model_error = None
+                self._model_state = "ready" if self.final is not None and self.draft is not None else "not-loaded"
         return self.status()
 
     @staticmethod
@@ -304,6 +316,8 @@ class TranscriptionRuntime:
         if profile is not None and profile.backend != "faster-whisper":
             model = self._load_transformers(profile)
         else:
+            if WhisperModel is None:
+                raise RuntimeError("faster-whisper is not installed; install requirements.txt before loading a transcription model")
             repo = MODELS.get(name, name)
             model = WhisperModel(
                 repo,
@@ -313,28 +327,128 @@ class TranscriptionRuntime:
             )
         return ModelBundle(model, threading.Lock(), ThreadPoolExecutor(max_workers=1))
 
+    def _set_model_state(self, state: str, error: str | None = None) -> None:
+        with self._state_lock:
+            self._model_state = state
+            self._model_error = error
+
+    @property
+    def last_decode(self) -> dict[str, Any]:
+        with self._decode_lock:
+            return dict(self._last_decode)
+
     def status(self) -> dict[str, Any]:
-        """Report configured and loaded models without exposing model internals."""
-        with self._load_lock:
+        """Report status without waiting for model download or initialization."""
+        # Do not acquire _load_lock here. This method is called by FastAPI
+        # handlers and the websocket receive loop while ensure_loaded() may be
+        # downloading several gigabytes in a worker thread.
+        with self._state_lock:
             profile = self._profile
-            loaded: list[str] = []
-            if self.final is not None and self._loaded_checkpoint == profile.checkpoint:
-                loaded.append(profile.checkpoint)
-            if self.draft is not None and self._loaded_draft_checkpoint == self._draft_checkpoint and self._draft_checkpoint != profile.checkpoint:
-                loaded.append(self._draft_checkpoint)
+            draft_checkpoint = self._draft_checkpoint
+            loaded_checkpoint = self._loaded_checkpoint
+            loaded_draft_checkpoint = self._loaded_draft_checkpoint
+            state = self._model_state
+            error = self._model_error
+            benchmark = dict(self._benchmark) if self._benchmark else None
+            final_loaded = self.final is not None
+            draft_loaded = self.draft is not None
+        loaded: list[str] = []
+        if final_loaded and loaded_checkpoint == profile.checkpoint:
+            loaded.append(profile.checkpoint)
+        if draft_loaded and loaded_draft_checkpoint == draft_checkpoint:
+            loaded.append(draft_checkpoint)
+        return {
+            "state": state,
+            "profile_id": profile.id,
+            "profile": profile.to_dict(),
+            "configured": {
+                "final": profile.checkpoint,
+                "draft": draft_checkpoint,
+            },
+            "loaded": loaded,
+            "device": "cpu",
+            "compute_type": profile.compute_type,
+            "backend": profile.backend,
+            "error": error,
+            "benchmark": benchmark,
+            "last_decode": self.last_decode,
+        }
+
+    @staticmethod
+    def _faster_model_label(profile: ModelProfile) -> str:
+        preferred = ("large-v3-turbo", "distil-large-v3", "small.en", "tiny.en")
+        for profile_id in preferred:
+            if profile_id != profile.id:
+                candidate = MODEL_PROFILE_BY_ID.get(profile_id)
+                if candidate:
+                    return candidate.label
+        return "a faster model"
+
+    def _run_startup_benchmark(self, bundle: ModelBundle, profile: ModelProfile) -> dict[str, Any]:
+        """Measure a short local decode before the first spoken segment."""
+        audio_seconds = max(1.0, min(10.0, float(getattr(self.config, "benchmark_seconds", 5.0))))
+        sample_count = int(round(audio_seconds * SR))
+        timeline = np.arange(sample_count, dtype=np.float32) / SR
+        audio = (
+            0.02 * np.sin(2.0 * np.pi * 220.0 * timeline)
+            + 0.01 * np.sin(2.0 * np.pi * 330.0 * timeline)
+        ).astype(np.float32)
+        started = time.perf_counter()
+        try:
+            with bundle.lock:
+                if profile.backend != "faster-whisper":
+                    bundle.model.transcribe(audio, self.config.language, "")
+                else:
+                    raw_segments, _info = bundle.model.transcribe(
+                        audio,
+                        language=self.config.language,
+                        beam_size=1,
+                        temperature=0.0,
+                        initial_prompt=None,
+                        hotwords=self.config.hotwords or None,
+                        condition_on_previous_text=False,
+                        without_timestamps=True,
+                        word_timestamps=False,
+                        vad_filter=False,
+                    )
+                    list(raw_segments)
+            decode_seconds = max(0.0, time.perf_counter() - started)
+            rtf = decode_seconds / audio_seconds
+            warning = rtf > 0.8
+            message = None
+            if warning:
+                message = (
+                    f"{profile.label} decodes ~{rtf:.1f}× slower than real time on this machine; "
+                    f"switch to {self._faster_model_label(profile)} or expect long delays."
+                )
+                logger.warning("startup benchmark warning: %s", message)
+            result = {
+                "state": "ready",
+                "model": profile.id,
+                "audio_seconds": audio_seconds,
+                "decode_seconds": decode_seconds,
+                "rtf": rtf,
+                "warning": warning,
+                "message": message,
+            }
+            logger.info(
+                "startup benchmark model=%s audio_seconds=%.2f decode_seconds=%.2f rtf=%.3f",
+                profile.id,
+                audio_seconds,
+                decode_seconds,
+                rtf,
+            )
+            return result
+        except Exception as exc:
+            logger.warning("startup benchmark failed model=%s error=%s", profile.id, exc)
             return {
-                "state": self._model_state,
-                "profile_id": profile.id,
-                "profile": profile.to_dict(),
-                "configured": {
-                    "final": profile.checkpoint,
-                    "draft": self._draft_checkpoint,
-                },
-                "loaded": loaded,
-                "device": "cpu",
-                "compute_type": profile.compute_type,
-                "backend": profile.backend,
-                "error": self._model_error,
+                "state": "error",
+                "model": profile.id,
+                "audio_seconds": audio_seconds,
+                "decode_seconds": None,
+                "rtf": None,
+                "warning": False,
+                "message": f"Startup benchmark unavailable: {type(exc).__name__}",
             }
 
     def ensure_loaded(self) -> None:
@@ -347,23 +461,93 @@ class TranscriptionRuntime:
                 and self._loaded_checkpoint == target_checkpoint
                 and self._loaded_draft_checkpoint == target_draft
             ):
-                self._model_state = "ready"
+                self._set_model_state("ready")
+                if self._benchmark is None:
+                    benchmark = self._run_startup_benchmark(self.final, self._profile)
+                    with self._state_lock:
+                        self._benchmark = benchmark
                 return
-            self._model_state = "loading"
-            self._model_error = None
+            started = time.perf_counter()
+            logger.info(
+                "model load start final=%s draft=%s device=cpu compute_type=%s",
+                target_checkpoint,
+                target_draft,
+                self._profile.compute_type,
+            )
+            self._set_model_state("loading")
             try:
                 if self.final is None:
                     self.final = self._load(target_checkpoint, self._profile)
                 if self.draft is None:
                     draft_profile = self._profile_for_checkpoint(target_draft)
-                    self.draft = self.final if target_draft == target_checkpoint else self._load(target_draft, draft_profile)
-                self._loaded_checkpoint = target_checkpoint
-                self._loaded_draft_checkpoint = target_draft
-                self._model_state = "ready"
+                    # Never alias final and draft, even when a caller explicitly
+                    # requests the same checkpoint for both paths.
+                    self.draft = self._load(target_draft, draft_profile)
+                benchmark = self._run_startup_benchmark(self.final, self._profile)
+                with self._state_lock:
+                    self._loaded_checkpoint = target_checkpoint
+                    self._loaded_draft_checkpoint = target_draft
+                    self._benchmark = benchmark
+                self._set_model_state("ready")
+                logger.info(
+                    "model load finish final=%s draft=%s elapsed_seconds=%.2f",
+                    target_checkpoint,
+                    target_draft,
+                    time.perf_counter() - started,
+                )
             except Exception as exc:
-                self._model_state = "error"
-                self._model_error = type(exc).__name__
+                self._set_model_state("error", type(exc).__name__)
+                logger.exception("model load failed final=%s draft=%s", target_checkpoint, target_draft)
                 raise
+
+    def _record_decode(self, metadata: dict[str, Any]) -> None:
+        with self._decode_lock:
+            self._last_decode = dict(metadata)
+
+    def _finish_decode(
+        self,
+        final: bool,
+        audio_seconds: float,
+        started: float,
+        result: list[TranscriptSegment],
+        language: str | None,
+        rms: float,
+        peak: float,
+        no_speech_prob: float | None,
+        avg_logprob: float | None,
+    ) -> None:
+        decode_seconds = max(0.0, time.perf_counter() - started)
+        metadata = {
+            "event_type": "final" if final else "partial",
+            "audio_seconds": audio_seconds,
+            "decode_seconds": decode_seconds,
+            "rtf": decode_seconds / audio_seconds if audio_seconds else None,
+            "segments_returned": len(result),
+            "language": language,
+            "rms": rms,
+            "peak": peak,
+            "no_speech_prob": no_speech_prob,
+            "avg_logprob": avg_logprob,
+        }
+        self._record_decode(metadata)
+        logger.info(
+            "decode kind=%s audio_seconds=%.2f decode_seconds=%.2f rtf=%s segments_returned=%d language=%s",
+            metadata["event_type"],
+            audio_seconds,
+            decode_seconds,
+            f"{metadata['rtf']:.3f}" if metadata["rtf"] is not None else "n/a",
+            len(result),
+            language or "auto",
+        )
+        if not result:
+            logger.warning(
+                "decode returned zero segments no_speech_prob=%s avg_logprob=%s audio_seconds=%.2f rms=%.6f peak=%.6f",
+                no_speech_prob,
+                avg_logprob,
+                audio_seconds,
+                rms,
+                peak,
+            )
 
     def transcribe(
         self,
@@ -376,64 +560,108 @@ class TranscriptionRuntime:
 
         The listening layer already found a speech boundary, so Whisper's own
         VAD is disabled here to avoid double filtering quiet words at the edges.
-        ``final`` uses the configured wide beam; partials use the same loaded
-        model with a smaller beam to keep the UI responsive when possible.
+        ``final`` uses the configured beam; partials use the dedicated small
+        draft model with a smaller beam so draft work cannot block finals.
         """
         self.ensure_loaded()
         with self._load_lock:
             profile = self._profile
             bundle = self.final if final else self.draft
         assert bundle is not None
+        decode_started = time.perf_counter()
         if audio is None or not len(audio):
+            metadata = {
+                "event_type": "final" if final else "partial",
+                "audio_seconds": 0.0,
+                "decode_seconds": 0.0,
+                "rtf": None,
+                "segments_returned": 0,
+                "language": self.config.language,
+                "rms": 0.0,
+                "peak": 0.0,
+                "no_speech_prob": None,
+                "avg_logprob": None,
+            }
+            self._record_decode(metadata)
+            logger.warning("decode returned zero segments audio_seconds=0.00 rms=0.000000 peak=0.000000")
             return [], self.config.language
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
         if not np.isfinite(audio).all():
             audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-        peak = float(np.abs(audio).max())
+        audio_seconds = len(audio) / SR
+        rms = float(np.sqrt(np.mean(audio * audio))) if len(audio) else 0.0
+        peak = float(np.abs(audio).max()) if len(audio) else 0.0
         if 0 < peak < 0.7:
             audio = audio * min(0.85 / peak, 20.0)
-        prompt_parts = [
-            "Transcribe verbatim. Preserve every spoken word, technical term, name, acronym, number, unit, punctuation, equation, code command, URL, file path, and capitalization.",
-            self.config.hotwords or "",
-            context[-self.config.context_chars:],
-        ]
+        prompt_parts: list[str] = []
+        context_limit = min(200, max(0, int(getattr(self.config, "context_chars", 200))))
+        if getattr(self.config, "use_context_prompt", False) and context and context_limit:
+            prompt_parts.append(context[-context_limit:])
+        # initial_prompt is previous-text conditioning, not an instruction.
         initial_prompt = " ".join(part for part in prompt_parts if part).strip()
         if profile.backend != "faster-whisper":
             with bundle.lock:
                 external_text, external_language = bundle.model.transcribe(audio, self.config.language, initial_prompt)
-            if not external_text:
-                return [], external_language or self.config.language
-            segment_id = f"seg-{int(offset * 1000):09d}-external"
-            speaker, speaker_confidence = self.speakers.label(segment_id)
-            return [TranscriptSegment(
-                id=segment_id,
-                start=offset,
-                end=offset + len(audio) / SR,
-                text=external_text,
-                confidence=0.82,
-                speaker=speaker,
-                speaker_confidence=speaker_confidence,
-                language=external_language or self.config.language,
-            )], external_language or self.config.language
+            language = external_language or self.config.language
+            result = []
+            if external_text:
+                segment_id = f"seg-{int(offset * 1000):09d}-external"
+                speaker, speaker_confidence = self.speakers.label(segment_id)
+                result = [TranscriptSegment(
+                    id=segment_id,
+                    start=offset,
+                    end=offset + audio_seconds,
+                    text=external_text,
+                    confidence=0.82,
+                    speaker=speaker,
+                    speaker_confidence=speaker_confidence,
+                    language=language,
+                )]
+            self._finish_decode(
+                final,
+                audio_seconds,
+                decode_started,
+                result,
+                language,
+                rms,
+                peak,
+                None,
+                None,
+            )
+            return result, language
 
         with bundle.lock:
             raw_segments, info = bundle.model.transcribe(
                 audio,
                 language=self.config.language,
-                beam_size=max(1, (int(self.config.beam_size) if profile.id in {"large-v3", "custom"} else profile.beam_size) if final else 2),
+                beam_size=max(
+                    1,
+                    (int(self.config.beam_size) if profile.id in {"large-v3", "large-v3-turbo", "custom"} else profile.beam_size)
+                    if final else 2,
+                ),
                 temperature=list(profile.temperatures) if final else 0.0,
                 initial_prompt=initial_prompt or None,
-                hotwords=self.config.hotwords if final else None,
+                hotwords=self.config.hotwords or None,
                 condition_on_previous_text=False,
                 without_timestamps=False,
-                word_timestamps=True,
+                word_timestamps=final,
                 vad_filter=False,
-                no_speech_threshold=0.6,
+                no_speech_threshold=0.7,
                 compression_ratio_threshold=2.8,
-                log_prob_threshold=-1.2,
+                log_prob_threshold=-1.5,
             )
             raw_segments = list(raw_segments)
         language = getattr(info, "language", None) or self.config.language
+        raw_no_speech = [
+            float(getattr(raw, "no_speech_prob"))
+            for raw in raw_segments
+            if getattr(raw, "no_speech_prob", None) is not None
+        ]
+        raw_avg_logprob = [
+            float(getattr(raw, "avg_logprob"))
+            for raw in raw_segments
+            if getattr(raw, "avg_logprob", None) is not None
+        ]
         result: list[TranscriptSegment] = []
         for index, raw in enumerate(raw_segments):
             text = str(getattr(raw, "text", "") or "").strip()
@@ -470,7 +698,19 @@ class TranscriptionRuntime:
                 language=language,
                 words=words,
             ))
-        return self._merge_fragments(result), language
+        merged = self._merge_fragments(result)
+        self._finish_decode(
+            final,
+            audio_seconds,
+            decode_started,
+            merged,
+            language,
+            rms,
+            peak,
+            max(raw_no_speech) if raw_no_speech else None,
+            min(raw_avg_logprob) if raw_avg_logprob else None,
+        )
+        return merged, language
 
     @staticmethod
     def _merge_fragments(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:

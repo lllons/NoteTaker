@@ -51,13 +51,14 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-The requirements are intentionally small:
+The requirements are intentionally small and CPU-only:
 
-- `faster-whisper` — local Whisper transcription and CTranslate2 model loading.
+- `faster-whisper==1.2.1` — local Whisper transcription and CTranslate2 model loading with a tested VAD signature.
 - `onnxruntime` — CPU Silero VAD used to find speech boundaries.
 - `fastapi` — HTTP and WebSocket application server.
 - `uvicorn[standard]` — ASGI server.
 - `numpy` — PCM audio conversion and signal handling.
+- `scipy` — anti-aliased browser sample-rate conversion.
 
 The default install keeps the lightweight faster-whisper CPU path. The three larger 1.7B–7B choices use an optional Transformers backend because they are different audio-language architectures:
 
@@ -79,7 +80,7 @@ Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser. If the
 
 The first capture can take longer because the selected Whisper model and CPU VAD assets are loaded and downloaded when capture starts. Once the page opens:
 
-1. Choose one of the **CPU transcription model** choices. The selection is remembered in this browser and applies to the next capture. Start with **Large-v3 · Best overall** or **Large-v3 · Maximum CPU decode** when retaining every detail matters most.
+1. Choose one of the **CPU transcription model** choices. The selection is remembered in this browser and applies to the next capture. Start with **Large-v3 Turbo · Faster** for live CPU capture; **Large-v3 · Offline / slower than real time** is available when latency does not matter.
 2. Press **Start capture**.
 3. Allow microphone access when the browser asks.
 4. Speak normally or play audio near the selected microphone.
@@ -170,13 +171,13 @@ The web selector lists public Hugging Face checkpoints across two local CPU back
 
 | Choice | Size / backend | Hugging Face checkpoint | Best use |
 | --- | --- | --- | --- |
-| **Large-v3 · Best overall** | 1.55B · CTranslate2 int8 | `Systran/faster-whisper-large-v3` | Best general Whisper accuracy; recommended default |
+| **Large-v3 · Offline / slower than real time** | 1.55B · CTranslate2 int8 | `Systran/faster-whisper-large-v3` | Best general Whisper accuracy when latency does not matter |
 | **Large-v3 · Maximum CPU decode** | 1.55B · CTranslate2 int8 | `Systran/faster-whisper-large-v3` | Same weights with beam 20 and fallback passes |
 | **Qwen3-ASR · 1.7B · Multilingual** | 1.7B · Transformers float32 | `Qwen/Qwen3-ASR-1.7B-hf` | Dedicated high-accuracy multilingual ASR |
 | **Voxtral Mini · 3B · Transcription** | 3B · Transformers float32 | `mistralai/Voxtral-Mini-3B-2507` | Dedicated long-form transcription mode |
 | **Qwen2-Audio · 7B · Deep audio** | 7B · Transformers float32 | `Qwen/Qwen2-Audio-7B-Instruct` | Largest audio-language option for difficult recordings |
 | **Distil-large-v3 · High quality** | 756M · CTranslate2 int8 | `Systran/faster-distil-whisper-large-v3` | Large distilled model with lower CPU cost |
-| **Large-v3 Turbo · Faster** | 809M · CTranslate2 int8 | `deepdml/faster-whisper-large-v3-turbo-ct2` | Faster large-model capture with a quality trade-off |
+| **Large-v3 Turbo · Faster** | 809M · CTranslate2 int8 | `deepdml/faster-whisper-large-v3-turbo-ct2` | Recommended live CPU default with a quality trade-off |
 | **Medium / Medium English** | 769M · CTranslate2 int8 | `Systran/faster-whisper-medium(.en)` | Strong lower-memory multilingual or English capture |
 | **Small / Small English** | 244M · CTranslate2 int8 | `Systran/faster-whisper-small(.en)` | Moderate CPU fallback |
 | **Base / Base English** | 74M · CTranslate2 int8 | `Systran/faster-whisper-base(.en)` | Lightweight fallback |
@@ -184,30 +185,35 @@ The web selector lists public Hugging Face checkpoints across two local CPU back
 
 The selector is disabled while capture is active. Changing it applies to the next WebSocket session; switching checkpoints releases the old model before loading the new one. The three larger choices require `python -m pip install -r requirements-large-models.txt`; their public repositories do not require an API key. They return a timestamped transcript segment but do not currently provide Whisper-style word timestamps. The raw `openai/whisper-large-v3` repository is not listed because the default path expects a CTranslate2 conversion.
 
-The checked-in defaults in `notetaker.toml` remain:
+The checked-in defaults in `notetaker.toml` are tuned for live CPU capture:
 
 ```toml
-model = "large-v3"
-draft_model = "large-v3"
+model = "large-v3-turbo"
+draft_model = "tiny.en"
 language = "auto"
-beam_size = 8
+beam_size = 2
 threads = 0
+max_segment_seconds = 14
+soft_max_seconds = 8
 ```
+
+The selector still includes **Large-v3 · Offline / slower than real time** for an accuracy-first offline pass. On first load NoteTaker decodes five seconds of synthetic audio, reports its real-time factor (RTF), and warns in the page and terminal when the selected model is slower than real time.
 
 To choose a checkpoint explicitly from the command line:
 
 ```bash
 python NoteTaker.py \
-  --model large-v3 \
-  --draft large-v3 \
-  --beam 8 \
+  --model large-v3-turbo \
+  --draft tiny.en \
+  --beam 2 \
   --host 0.0.0.0 \
   --port 8000
 ```
 
 Useful guidance:
 
-- Use **Large-v3 · Best overall** first. Use **Large-v3 · Maximum CPU decode** when final accuracy matters more than wait time.
+- Use **Large-v3 Turbo · Faster** first for live capture. Use **Large-v3 · Offline / slower than real time** or **Large-v3 · Maximum CPU decode** when final accuracy matters more than wait time.
+- Watch the startup RTF warning and the `queued: N` pill. A measured RTF above `0.8` means the selected decoder cannot keep up with real-time audio on this machine.
 - Use `--lang en` or another known language code when the recording is consistently one language. Omit `--lang` to let Whisper detect it.
 - Provide domain vocabulary so technical names are more likely to be preserved:
 
@@ -225,23 +231,30 @@ Runtime defaults live in `notetaker.toml`. Environment variables override values
 
 | Setting | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
-| `model` | `NOTE_TAKER_MODEL` | `large-v3` | Final CPU transcription model |
-| `draft_model` | `NOTE_TAKER_DRAFT_MODEL` | `large-v3` | Partial/live model; same model avoids a second cache |
+| `model` | `NOTE_TAKER_MODEL` | `large-v3-turbo` | Final CPU transcription model for live capture |
+| `draft_model` | `NOTE_TAKER_DRAFT_MODEL` | `tiny.en` | Dedicated small partial/live model |
 | `language` | `NOTE_TAKER_LANGUAGE` | automatic | Language code, or `auto` |
-| `beam_size` | `NOTE_TAKER_BEAM_SIZE` | `8` | Whisper decoding breadth |
+| `beam_size` | `NOTE_TAKER_BEAM_SIZE` | `2` | Whisper decoding breadth |
 | `threads` | `NOTE_TAKER_THREADS` | `0` | CPU thread limit; `0` is automatic |
 | `hotwords` | `NOTE_TAKER_HOTWORDS` | empty | Comma-separated domain terms |
 | `data_dir` | `NOTE_TAKER_DATA_DIR` | `data` | SQLite and application data directory |
-| `context_chars` | `NOTE_TAKER_CONTEXT_CHARS` | `1200` | Prior transcript context for live decoding |
-| `max_segment_seconds` | `NOTE_TAKER_MAX_SEGMENT_SECONDS` | `30` | Maximum VAD segment length |
+| `context_chars` | `NOTE_TAKER_CONTEXT_CHARS` | `200` | Optional prior transcript context; disabled by default |
+| `use_context_prompt` | `NOTE_TAKER_USE_CONTEXT_PROMPT` | `false` | Opt in to previous-text conditioning |
+| `max_segment_seconds` | `NOTE_TAKER_MAX_SEGMENT_SECONDS` | `14` | Hard maximum VAD segment length |
+| `soft_max_seconds` | `NOTE_TAKER_SOFT_MAX_SECONDS` | `8` | Soft split target at a low-VAD frame |
 | `min_segment_seconds` | `NOTE_TAKER_MIN_SEGMENT_SECONDS` | `0.15` | Minimum audio segment length |
 | `vad_on_threshold` | `NOTE_TAKER_VAD_ON_THRESHOLD` | `0.35` | Recall-first speech start threshold |
 | `vad_off_threshold` | `NOTE_TAKER_VAD_OFF_THRESHOLD` | `0.20` | Recall-first speech continuation threshold |
 | `preroll_seconds` | `NOTE_TAKER_PREROLL_SECONDS` | `1.0` | Audio retained before speech onset |
 | `end_silence_seconds` | `NOTE_TAKER_END_SILENCE_SECONDS` | `1.4` | Silence required to close an utterance |
 | `partial_seconds` | `NOTE_TAKER_PARTIAL_SECONDS` | `4.0` | Interval between draft updates |
+| `note_save_interval_seconds` | `NOTE_TAKER_NOTE_SAVE_INTERVAL_SECONDS` | `20.0` | Minimum interval between live note regeneration passes |
+| `max_inflight_decodes` | `NOTE_TAKER_MAX_INFLIGHT_DECODES` | `2` | Concurrent decode worker cap |
+| `max_pending_finals` | `NOTE_TAKER_MAX_PENDING_FINALS` | `8` | Buffered final utterance cap before audio backpressure |
+| `benchmark_seconds` | `NOTE_TAKER_BENCHMARK_SECONDS` | `5.0` | Startup benchmark audio duration |
 | `provider_timeout` | `NOTE_TAKER_PROVIDER_TIMEOUT` | `45` | Optional provider request timeout |
 | `diarization` | `NOTE_TAKER_DIARIZATION` | `labels-only` | Speaker-label mode |
+| `--log-level` | `NOTE_TAKER_LOG_LEVEL` | `INFO` | Terminal logging verbosity |
 
 For example, a low-resource Linux or macOS run can be started with:
 
@@ -341,6 +354,7 @@ notetaker/
   web.py                     embedded capture and knowledge-base UI
 tests/test_knowledge.py      offline knowledge-pipeline tests
 tests/test_model_profiles.py offline CPU model-selector tests
+tests/test_live_path.py       live-path regression tests (boundaries, resampling, prompts, backpressure)
 notes/notes.md               developer guide and operational notes
 notetaker.toml               checked-in runtime defaults
 requirements.txt             lightweight Python dependencies
@@ -385,13 +399,15 @@ The second form remains auditable: extracted items can be traced to source segme
 
 - The first VAD/model load and download are the most expensive startup steps; later sessions reuse cached weights.
 - Large-v3 runs on CPU with int8 weights; expect high memory use and slower-than-real-time decoding on many machines.
-- The selector exposes actual Hugging Face CTranslate2 checkpoints plus Qwen3-ASR 1.7B, Voxtral Mini 3B, and Qwen2-Audio 7B Transformers backends; only one checkpoint is kept loaded at a time.
+- The selector exposes actual Hugging Face CTranslate2 checkpoints plus Qwen3-ASR 1.7B, Voxtral Mini 3B, and Qwen2-Audio 7B Transformers backends; the final and dedicated draft bundles are kept separate so they cannot block one another.
 - The Transformers choices are explicitly CPU float32 rather than CTranslate2 int8, because these architectures are not faster-whisper checkpoints. Their optional dependencies are intentionally separate from the lightweight default install.
-- The draft path uses a small beam on the selected model, and stale partial work is dropped so a slow CPU cannot delay final utterances.
+- The draft path always uses its own `tiny.en` bundle with a small beam, and stale partial work is dropped so a slow CPU cannot delay final utterances.
+- Startup measures decoder RTF and warns before the first spoken segment when the selected model is slower than real time.
+- Audio resampling uses an anti-aliasing filter before browser 48 kHz input is reduced to 16 kHz.
 - Model inference uses bounded worker execution so concurrent transcription does not corrupt model state.
 - Each capture receives a unique note ID and the browser waits for a final `flushed` confirmation before declaring the note saved.
 - SQLite keeps durable notes on disk instead of retaining every session only in memory.
-- Extraction is incremental for live sessions, and the optional provider is not required for saving notes.
+- Live note regeneration is debounced to one pass at most every 20 seconds and always runs a complete final pass on flush; the optional provider is not required for saving notes.
 - Larger models and higher beam sizes generally improve recognition but increase memory use and latency.
 - Local deterministic mode keeps microphone audio and notes in the local application process and `data/` directory. Configure an LLM provider only when you accept sending transcript text to that provider.
 
@@ -419,13 +435,17 @@ Allow the site in the browser's microphone permissions. On macOS, also enable th
 
 Run `python -m pip install -r requirements.txt` again so `onnxruntime` is installed. The app uses Silero VAD on CPU when available and shows `energy-fallback` when it is not. If the fallback is shown, the microphone frames are still accepted, but installing `onnxruntime` gives better speech boundaries. Watch the level meter and wait for the `saved` confirmation after pressing **Stop capture**.
 
+### Capture runs but no text appears
+
+Do not infer a hang from a moving level meter alone. On startup NoteTaker benchmarks the selected decoder and shows an RTF warning when it is slower than real time; switch to **Large-v3 Turbo**, **Distil-large-v3**, or a smaller CPU model when the warning is prominent. During capture, watch the `queued: N` pill and the terminal logs for `segment emitted`, `decode`, `decode returned zero segments`, and `note save` lines. A visible **No speech recognised in this segment** row is an explicit empty decoder result, not a silent failure. The client watchdog appears after 45 seconds of detected speech without a partial or final result.
+
 ### The first run is slow or appears idle
 
-The server prints its local URL immediately, then the selected model and CPU VAD initialize when you press **Start capture**. Check the model/VAD status pill, the final `flushed` message, and the terminal. The first large-v3 download can take a while; if a 1.7B, 3B, or 7B choice reports missing optional dependencies, install `requirements-large-models.txt` and retry.
+The server prints its local URL immediately, then the selected model, dedicated tiny draft model, CPU VAD, and five-second startup benchmark initialize when you press **Start capture**. Check the model/RTF status, queue pill, final `flushed` message, and terminal logs. The first model download can take a while; if a 1.7B, 3B, or 7B choice reports missing optional dependencies, install `requirements-large-models.txt` and retry.
 
 ### Transcription quality is poor
 
-The default checkpoint is already the largest configured model. Start with **Large-v3 · Best overall**, use **Large-v3 · Maximum CPU decode** when wait time does not matter, and choose a smaller/turbo/distilled option only when CPU time or RAM is limiting. Set a known `--lang`, pass domain-specific `--hotwords`, and check microphone input level. The listening layer keeps a one-second pre-roll, longer pauses, and trailing partial frames; low-confidence segments remain visible for manual review rather than being silently “corrected.”
+The live default is **Large-v3 Turbo**. Use **Large-v3 · Offline / slower than real time** or **Large-v3 · Maximum CPU decode** for an offline-quality pass when wait time does not matter, and choose a smaller/distilled checkpoint when CPU time or RAM is limiting. Set a known `--lang`, pass domain-specific `--hotwords`, and check microphone input level. The listening layer keeps a one-second pre-roll, natural pause boundaries, soft splits, and trailing partial frames; low-confidence segments remain visible for manual review rather than being silently “corrected.”
 
 ### The port is already in use
 

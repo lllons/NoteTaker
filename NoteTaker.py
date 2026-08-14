@@ -4,20 +4,26 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Local-first high-fidelity knowledge capture")
-    parser.add_argument("--model", default=os.getenv("NOTE_TAKER_MODEL", "large-v3"))
-    parser.add_argument("--draft", default=os.getenv("NOTE_TAKER_DRAFT_MODEL", "large-v3"))
+    parser.add_argument("--model", default=os.getenv("NOTE_TAKER_MODEL", "large-v3-turbo"))
+    parser.add_argument("--draft", default=os.getenv("NOTE_TAKER_DRAFT_MODEL", "tiny.en"))
     parser.add_argument("--lang", default=os.getenv("NOTE_TAKER_LANGUAGE") or None)
     parser.add_argument("--hotwords", default=os.getenv("NOTE_TAKER_HOTWORDS") or None)
-    parser.add_argument("--beam", type=int, default=int(os.getenv("NOTE_TAKER_BEAM_SIZE", "8")))
+    parser.add_argument("--beam", type=int, default=int(os.getenv("NOTE_TAKER_BEAM_SIZE", "2")))
+    parser.add_argument("--log-level", type=str.upper, default=os.getenv("NOTE_TAKER_LOG_LEVEL", "INFO").upper(), choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
     parser.add_argument("--threads", type=int, default=int(os.getenv("NOTE_TAKER_THREADS", "0")))
     parser.add_argument("--host", default=os.getenv("HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
     args = parser.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     os.environ["NOTE_TAKER_MODEL"] = args.model
     os.environ["NOTE_TAKER_DRAFT_MODEL"] = args.draft
@@ -34,10 +40,10 @@ def main() -> None:
     display_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
     print(f"NoteTaker listening at http://{display_host}:{args.port}", flush=True)
     print(
-        f"Models: {args.model} + {args.draft} on CPU. CTranslate2 uses int8; larger Transformers models use float32. They download when capture starts and are cached locally.",
+        f"Models: final {args.model} + draft {args.draft} on CPU. CTranslate2 uses int8; larger Transformers models use float32. They download when capture starts and are cached locally.",
         flush=True,
     )
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
 
 
 if __name__ == "__main__":

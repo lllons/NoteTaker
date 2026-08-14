@@ -30,7 +30,7 @@ microphone
 
 ## Model choice and CPU behavior
 
-The checked-in default is the official `large-v3` CTranslate2 conversion. It is loaded with:
+The checked-in live default is `large-v3-turbo`; the selector keeps the official `large-v3` CTranslate2 conversion clearly labelled as offline/slower than real time. The final model is loaded with:
 
 ```python
 WhisperModel(repo, device="cpu", compute_type="int8", cpu_threads=threads)
@@ -44,7 +44,7 @@ There is no GPU requirement or GPU fallback. The catalog contains twelve faster-
 
 The three larger models use CPU float32 because they are not CTranslate2 Whisper checkpoints. Install their optional dependencies with `python -m pip install -r requirements-large-models.txt`. Each API entry includes its repository URL, parameter size, backend, precision, and quality/speed notes.
 
-The selector is applied when a new WebSocket capture starts and is disabled during capture. Switching checkpoints closes the old model bundle before loading the new one, keeping memory bounded. The draft path uses beam 2 for faster-whisper; the Transformers adapters run the same model for partial and final segments.
+The selector is applied when a new WebSocket capture starts and is disabled during capture. Switching checkpoints closes the old model bundles before loading the new ones, keeping memory bounded. The final and draft paths never share a `ModelBundle`: live defaults use Turbo plus a dedicated `tiny.en` draft bundle, with beam 2 for both faster-whisper paths. Startup decodes five seconds of synthetic audio, reports RTF, and warns before speech when RTF exceeds 0.8.
 
 The official large-v3 checkpoint is the best general choice when retaining names, numbers, and technical details matters more than latency. The `large-v3-max` entry uses the same weights with beam 20 and multiple fallback temperatures. Qwen3-ASR is the first larger model to try for multilingual speech; Voxtral is useful for long-form transcription; Qwen2-Audio is the largest option but can require 30GB or more of CPU RAM in float32. The larger adapters currently preserve a timestamped segment but do not emit Whisper-style word timestamps.
 
@@ -52,7 +52,8 @@ Expect the following:
 
 - The first selected model downloads its Hugging Face cache and can take a long time.
 - CPU large-v3 can be slower than real time; 1.7B–7B float32 models can be dramatically slower and use substantial RAM.
-- Model status is available at `GET /api/health`, the full catalog at `GET /api/models`, and live state is sent over the WebSocket as `model` messages.
+- Model status is available at `GET /api/health`, the full catalog at `GET /api/models`, and live state is sent over the WebSocket as `model` and `benchmark` messages.
+- Use `--log-level DEBUG|INFO|WARNING|ERROR|CRITICAL` (or `NOTE_TAKER_LOG_LEVEL`) to control terminal diagnostics.
 - Public model repositories do not require an API key. The optional Transformers dependencies are local-only and do not contact an inference API.
 
 Model aliases and backend adapters are in `notetaker/transcription.py`; catalog metadata is in `notetaker/config.py`.
@@ -68,7 +69,7 @@ python -m pip install -r requirements-large-models.txt
 python NoteTaker.py --host 127.0.0.1 --port 8000
 ```
 
-Open the URL printed by the CLI. The first **Start capture** initializes CPU VAD and the selected Whisper model. Allow the browser microphone prompt, speak, then press **Stop capture** and wait for the `saved`/`flushed` confirmation.
+Open the URL printed by the CLI. The first **Start capture** initializes CPU VAD, the selected final model, the dedicated draft model, and the startup benchmark. Allow the browser microphone prompt, speak, then press **Stop capture** and wait for the `saved`/`flushed` confirmation.
 
 The command-line options override environment/config values for the current process. `notetaker.toml` is the checked-in default source, and environment variables override that file. The browser selector is a per-browser preference for the next capture; it does not edit `notetaker.toml`. Do not put API keys in the TOML file or in committed notes.
 
@@ -78,17 +79,18 @@ The command-line options override environment/config values for the current proc
 
 Current recall-oriented behavior:
 
-- Browser audio is converted to finite float32 values and resampled to 16 kHz before VAD.
+- Browser audio is converted to finite float32 values and anti-aliased with `scipy.signal.resample_poly` before conversion to 16 kHz and VAD. A numpy FFT low-pass is retained as an import-time fallback.
 - A one-second pre-roll is retained so the first consonants of a phrase are not cut off.
 - Speech starts after two positive frames, using a lowered VAD onset threshold plus a bounded energy hint for quiet speakers.
 - An utterance remains open through about 1.4 seconds of silence, preserving pauses and trailing words.
-- Utterances can run for 30 seconds before a final event is emitted.
-- Partial updates are emitted about every four seconds. Slow CPU decoding is throttled in `notetaker/app.py`; stale partial tasks are skipped, but final utterances are not dropped.
+- Natural pauses close utterances using VAD probability alone; the energy hint is used only to open speech. The noise floor continues to adapt with a slower time constant while speech is open.
+- Utterances target an eight-second soft split at the lowest-VAD frame in the last second and have a fourteen-second hard maximum.
+- Partial updates are emitted about every four seconds. `DecodeScheduler` caps active decode workers at two, drops only queued partials with a logged reason, and applies websocket backpressure to finals instead of dropping them.
 - `flush()` appends the browser's final short frame instead of discarding it, and the WebSocket waits for all final tasks before sending `flushed`.
-- Silero VAD uses `onnxruntime` on CPU. If that package is unavailable, `Vad` switches to an explicitly reported energy fallback instead of terminating the WebSocket before transcription.
+- Silero VAD uses `onnxruntime` on CPU. `Vad` detects the installed ONNX input names/shapes for both h/c and state/sr signatures; unknown signatures are recorded as a clear error and switch to an explicitly reported energy fallback instead of terminating the WebSocket before transcription. The client receives a VAD update after the first frame so fallback status is honest.
 - The raw transcript keeps short words and filler. The extractor may remove obvious filler from derived note layers, but source transcript evidence should not be discarded in the STT layer.
 
-Tuning values are in `notetaker.toml` and can be overridden with `NOTE_TAKER_*` environment variables. Lower VAD thresholds improve recall but can include more background noise. Increase `preroll_seconds` or `end_silence_seconds` when words are being clipped at boundaries; increase `partial_seconds` when large-v3 saturates the CPU.
+Tuning values are in `notetaker.toml` and can be overridden with `NOTE_TAKER_*` environment variables. Lower VAD thresholds improve recall but can include more background noise. Increase `preroll_seconds` or `end_silence_seconds` when words are being clipped at boundaries; increase `partial_seconds` when the measured RTF is high. `use_context_prompt` is false by default because `initial_prompt` is previous-text conditioning, not an instruction.
 
 ## Transcription layer
 
@@ -99,7 +101,7 @@ Important decoding safeguards:
 - `vad_filter=False` is intentional. The listening layer already found the speech boundaries; applying Whisper VAD a second time can remove quiet edge words.
 - Word timestamps, language, confidence, no-speech probability, and decoder metadata are retained in the schema.
 - `condition_on_previous_text=False` limits repetition cascades between independent VAD utterances.
-- The prompt asks Whisper to preserve technical terms, names, numbers, URLs, paths, commands, and capitalization. `hotwords` can add domain vocabulary.
+- `initial_prompt` is empty by default; optional rolling context is capped at 200 characters and must be explicitly enabled. Domain vocabulary is passed through `hotwords` to both partial and final decodes.
 - Low-confidence segments are marked for review. Do not turn low confidence into invented corrections.
 - The built-in speaker mode is `labels-only`. `Speaker 1` is a schema label, not acoustic diarization.
 
@@ -118,7 +120,7 @@ The storage index serializes the complete note body, not only the summary, so co
 
 ## Tests and checks
 
-The offline tests intentionally do not load Whisper weights or VAD assets:
+The offline tests intentionally do not load Whisper weights or VAD assets; `tests/test_live_path.py` covers boundaries, anti-aliasing, empty events, backpressure, and prompt handling when the runtime dependencies are installed:
 
 ```bash
 python -m unittest discover -s tests -v
@@ -145,15 +147,19 @@ All models are intentionally slow to download and initialize. Check the selected
 
 ### Capture says no speech was detected
 
-Verify the level meter moves. Install the checked-in requirements so `onnxruntime` is present; the status message reports `backend: silero` when the real CPU VAD is active. If it reports `energy-fallback`, audio is still accepted, but installing `onnxruntime` improves speech boundaries. Press **Stop capture** and wait for `flushed`; it reports whether a note was saved.
+Verify the level meter moves. Install the checked-in requirements so `onnxruntime` is present; the status message reports `backend: silero` when the real CPU VAD is active. If it reports `energy-fallback`, audio is still accepted, but installing `onnxruntime` improves speech boundaries. Press **Stop capture** and wait for `flushed`; it reports whether a note was saved and shows an explicit no-speech row when nothing reached the decoder.
 
 ### Words at the start or end are missing
 
 Inspect the `listening/` thresholds first. Increase `preroll_seconds` and `end_silence_seconds`; do not immediately add more aggressive Whisper post-processing. Verify that `flush()` receives the final browser frame and that `vad_filter` remains disabled for already-segmented audio.
 
+### Capture runs but no text appears
+
+A moving level meter only proves that audio arrived. Check the startup RTF banner, the `queued: N` pill, and terminal lines for `segment emitted`, `decode`, `decode returned zero segments`, dropped partial reasons, and `note save`. If RTF is above 0.8, switch from large-v3 or a larger Transformers option to **Large-v3 Turbo**, **Distil-large-v3**, or a smaller checkpoint. The browser watchdog shows a persistent queue/RTF warning after 45 seconds of detected speech without a partial or final event. A **No speech recognised in this segment** row means the decoder explicitly returned no segments.
+
 ### The transcript lags
 
-This is expected with full large-v3 on CPU and even more pronounced with the 1.7B–7B Transformers choices. Choose Qwen3-ASR for the best larger-model starting point, or choose a smaller CTranslate2/turbo/distilled checkpoint for quicker final events; preserve final events and do not silently discard audio.
+This is expected with offline large-v3 on CPU and even more pronounced with the 1.7B–7B Transformers choices. Choose Turbo or a smaller CTranslate2/distilled checkpoint for quicker final events; the scheduler preserves final utterances, logs dropped partials, and applies backpressure rather than silently discarding audio.
 
 ### Speaker names are wrong
 

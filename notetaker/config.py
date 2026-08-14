@@ -51,13 +51,13 @@ class ModelProfile:
 # CPU inference. Keeping the backend in profile metadata prevents the web
 # selector from advertising a checkpoint the loader cannot actually use.
 MODEL_PROFILES: tuple[ModelProfile, ...] = (
-    ModelProfile("large-v3", "Large-v3 · Best overall", "large-v3", "https://huggingface.co/Systran/faster-whisper-large-v3", 8, (0.0,), "Official large-v3 conversion; strongest general-purpose option for preserving names, numbers, and technical speech.", "slowest", "best"),
+    ModelProfile("large-v3", "Large-v3 · Offline / slower than real time", "large-v3", "https://huggingface.co/Systran/faster-whisper-large-v3", 8, (0.0,), "Official large-v3 conversion; use for offline-quality transcription because it is slower than real time on many CPUs.", "offline", "best"),
     ModelProfile("large-v3-max", "Large-v3 · Maximum CPU decode", "large-v3", "https://huggingface.co/Systran/faster-whisper-large-v3", 20, (0.0, 0.15, 0.3, 0.5), "The same best checkpoint with the widest beam and fallback passes; use when latency does not matter.", "extreme", "maximum"),
     ModelProfile("qwen3-asr-1.7b", "Qwen3-ASR · 1.7B · Multilingual", "Qwen/Qwen3-ASR-1.7B-hf", "https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf", 1, (0.0,), "Dedicated multilingual ASR model with strong recognition of accents, technical speech, and long recordings.", "very slow", "excellent", backend="transformers-qwen3-asr", parameters="1.7B", compute_type="float32", optional_requirements="requirements-large-models.txt"),
     ModelProfile("voxtral-mini-3b", "Voxtral Mini · 3B · Transcription", "mistralai/Voxtral-Mini-3B-2507", "https://huggingface.co/mistralai/Voxtral-Mini-3B-2507", 1, (0.0,), "A 3B audio-language model with a dedicated transcription mode and long-form audio support.", "extreme", "very high", backend="transformers-voxtral", parameters="3B", compute_type="float32", optional_requirements="requirements-large-models.txt"),
     ModelProfile("qwen2-audio-7b", "Qwen2-Audio · 7B · Deep audio", "Qwen/Qwen2-Audio-7B-Instruct", "https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct", 1, (0.0,), "A 7B audio-language model prompted for verbatim speech transcription; best reserved for machines with substantial RAM.", "extreme", "very high", backend="transformers-qwen2-audio", parameters="7B", compute_type="float32", optional_requirements="requirements-large-models.txt"),
     ModelProfile("distil-large-v3", "Distil-large-v3 · High quality", "distil-large-v3", "https://huggingface.co/Systran/faster-distil-whisper-large-v3", 8, (0.0,), "Large distilled Whisper checkpoint designed for faster-whisper; faster and lighter with a quality trade-off.", "slow", "very high"),
-    ModelProfile("large-v3-turbo", "Large-v3 Turbo · Faster", "large-v3-turbo", "https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2", 5, (0.0,), "Large-v3 Turbo CTranslate2 conversion; a practical speed choice when large-v3 is too slow.", "fast", "high"),
+    ModelProfile("large-v3-turbo", "Large-v3 Turbo · Faster", "large-v3-turbo", "https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2", 5, (0.0,), "Large-v3 Turbo CTranslate2 conversion; the recommended practical default for live CPU capture.", "fast", "high"),
     ModelProfile("medium", "Medium · Multilingual", "medium", "https://huggingface.co/Systran/faster-whisper-medium", 8, (0.0,), "Official multilingual medium checkpoint for lower memory use while retaining broad language coverage.", "slow", "high"),
     ModelProfile("medium.en", "Medium English", "medium.en", "https://huggingface.co/Systran/faster-whisper-medium.en", 8, (0.0,), "English-only medium checkpoint; a strong CPU choice for clear English recordings.", "slow", "high"),
     ModelProfile("small", "Small · Multilingual", "small", "https://huggingface.co/Systran/faster-whisper-small", 8, (0.0,), "Official multilingual small checkpoint for a much lighter CPU footprint.", "medium", "good"),
@@ -68,7 +68,7 @@ MODEL_PROFILES: tuple[ModelProfile, ...] = (
     ModelProfile("tiny.en", "Tiny English", "tiny.en", "https://huggingface.co/Systran/faster-whisper-tiny.en", 8, (0.0,), "Smallest English-only checkpoint; not recommended when retaining every detail matters.", "fastest", "basic"),
 )
 MODEL_PROFILE_BY_ID = {profile.id: profile for profile in MODEL_PROFILES}
-DEFAULT_MODEL_PROFILE_ID = "large-v3"
+DEFAULT_MODEL_PROFILE_ID = "large-v3-turbo"
 
 try:
     import tomllib
@@ -78,10 +78,10 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 
 @dataclass(frozen=True)
 class AppConfig:
-    model: str = "large-v3"
-    draft_model: str = "large-v3"
+    model: str = "large-v3-turbo"
+    draft_model: str = "tiny.en"
     language: str | None = None
-    beam_size: int = 8
+    beam_size: int = 2
     threads: int = 0
     hotwords: str | None = None
     data_dir: Path = Path("data")
@@ -89,14 +89,20 @@ class AppConfig:
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str = ""
-    context_chars: int = 1200
-    max_segment_seconds: int = 30
+    context_chars: int = 200
+    use_context_prompt: bool = False
+    max_segment_seconds: int = 14
+    soft_max_seconds: float = 8.0
     min_segment_seconds: float = 0.15
     vad_on_threshold: float = 0.35
     vad_off_threshold: float = 0.20
     preroll_seconds: float = 1.0
     end_silence_seconds: float = 1.4
     partial_seconds: float = 4.0
+    note_save_interval_seconds: float = 20.0
+    max_inflight_decodes: int = 2
+    max_pending_finals: int = 8
+    benchmark_seconds: float = 5.0
     provider_timeout: int = 45
 
     @classmethod
@@ -113,6 +119,13 @@ class AppConfig:
         language = value("language", "NOTE_TAKER_LANGUAGE", None)
         if language in ("", "auto", "None"):
             language = None
+
+        def boolean(name: str, env_name: str, default: bool) -> bool:
+            raw = value(name, env_name, default)
+            if isinstance(raw, bool):
+                return raw
+            return str(raw).strip().casefold() in {"1", "true", "yes", "on"}
+
         vad_on_threshold = max(0.05, min(0.99, float(value("vad_on_threshold", "NOTE_TAKER_VAD_ON_THRESHOLD", cls.vad_on_threshold))))
         vad_off_threshold = max(0.02, min(vad_on_threshold - 0.01, float(value("vad_off_threshold", "NOTE_TAKER_VAD_OFF_THRESHOLD", cls.vad_off_threshold))))
         return cls(
@@ -127,13 +140,19 @@ class AppConfig:
             llm_base_url=value("llm_base_url", "NOTE_TAKER_LLM_BASE_URL", None) or None,
             llm_api_key=value("llm_api_key", "NOTE_TAKER_LLM_API_KEY", None) or None,
             llm_model=str(value("llm_model", "NOTE_TAKER_LLM_MODEL", "")),
-            context_chars=max(200, int(value("context_chars", "NOTE_TAKER_CONTEXT_CHARS", cls.context_chars))),
+            context_chars=max(0, min(200, int(value("context_chars", "NOTE_TAKER_CONTEXT_CHARS", cls.context_chars)))),
+            use_context_prompt=boolean("use_context_prompt", "NOTE_TAKER_USE_CONTEXT_PROMPT", cls.use_context_prompt),
             max_segment_seconds=max(5, int(value("max_segment_seconds", "NOTE_TAKER_MAX_SEGMENT_SECONDS", cls.max_segment_seconds))),
+            soft_max_seconds=max(4.0, min(float(value("soft_max_seconds", "NOTE_TAKER_SOFT_MAX_SECONDS", cls.soft_max_seconds)), float(value("max_segment_seconds", "NOTE_TAKER_MAX_SEGMENT_SECONDS", cls.max_segment_seconds)) - 1.0)),
             min_segment_seconds=max(0.1, float(value("min_segment_seconds", "NOTE_TAKER_MIN_SEGMENT_SECONDS", cls.min_segment_seconds))),
             vad_on_threshold=vad_on_threshold,
             vad_off_threshold=vad_off_threshold,
             preroll_seconds=max(0.25, min(3.0, float(value("preroll_seconds", "NOTE_TAKER_PREROLL_SECONDS", cls.preroll_seconds)))),
             end_silence_seconds=max(0.5, min(4.0, float(value("end_silence_seconds", "NOTE_TAKER_END_SILENCE_SECONDS", cls.end_silence_seconds)))),
             partial_seconds=max(1.0, min(10.0, float(value("partial_seconds", "NOTE_TAKER_PARTIAL_SECONDS", cls.partial_seconds)))),
+            note_save_interval_seconds=max(1.0, float(value("note_save_interval_seconds", "NOTE_TAKER_NOTE_SAVE_INTERVAL_SECONDS", cls.note_save_interval_seconds))),
+            max_inflight_decodes=max(1, int(value("max_inflight_decodes", "NOTE_TAKER_MAX_INFLIGHT_DECODES", cls.max_inflight_decodes))),
+            max_pending_finals=max(1, int(value("max_pending_finals", "NOTE_TAKER_MAX_PENDING_FINALS", cls.max_pending_finals))),
+            benchmark_seconds=max(1.0, min(10.0, float(value("benchmark_seconds", "NOTE_TAKER_BENCHMARK_SECONDS", cls.benchmark_seconds)))),
             provider_timeout=max(5, int(value("provider_timeout", "NOTE_TAKER_PROVIDER_TIMEOUT", cls.provider_timeout))),
         )

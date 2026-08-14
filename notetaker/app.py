@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
+import logging
 import math
-from typing import Any
+import time
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import numpy as np
@@ -23,6 +26,174 @@ from listening.audio import SR, Segmenter, resample_audio
 from .storage import KnowledgeStore
 from .transcription import TranscriptionRuntime
 from .web import PAGE
+
+
+logger = logging.getLogger(__name__)
+
+
+class DecodeScheduler:
+    """Bound live decode work and prioritize final utterances over drafts.
+
+    Finals are never discarded. If the final buffer is full, submit() applies
+    backpressure to the websocket receive loop instead of allocating another
+    audio buffer. Partials have one pending slot and are deliberately dropped
+    when a final is pending or another partial is already queued.
+    """
+
+    def __init__(
+        self,
+        process: Callable[[str, Any, int, float], Awaitable[None]],
+        max_inflight: int = 2,
+        max_pending_finals: int = 8,
+    ) -> None:
+        self.process = process
+        self.max_inflight = max(1, int(max_inflight))
+        self.max_pending_finals = max(1, int(max_pending_finals))
+        self._condition = asyncio.Condition()
+        self._finals: deque[tuple[str, Any, int, float]] = deque()
+        self._partial: tuple[str, Any, int, float] | None = None
+        self._workers: set[asyncio.Task[Any]] = set()
+        self._active = 0
+        self._closed = False
+        self._last_depth = -1
+
+    @property
+    def depth(self) -> int:
+        return self._active + len(self._finals) + (1 if self._partial is not None else 0)
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    @property
+    def pending_finals(self) -> int:
+        return len(self._finals)
+
+    def _log_depth(self) -> None:
+        depth = self.depth
+        if depth == self._last_depth:
+            return
+        self._last_depth = depth
+        logger.info(
+            "decode queue depth=%d active=%d pending_finals=%d partial_pending=%s",
+            depth,
+            self._active,
+            len(self._finals),
+            self._partial is not None,
+        )
+
+    async def start(self) -> None:
+        if self._workers:
+            return
+        for _ in range(self.max_inflight):
+            task = asyncio.create_task(self._worker())
+            self._workers.add(task)
+
+    async def submit(self, event_type: str, audio: Any, sid: int, offset: float) -> bool:
+        await self.start()
+        event = (event_type, audio, sid, offset)
+        async with self._condition:
+            if self._closed:
+                if event_type == "final":
+                    raise RuntimeError("decode scheduler is closed; final audio was not accepted")
+                logger.warning("dropped partial reason=scheduler-closed")
+                return False
+            if event_type == "partial":
+                if self._finals:
+                    logger.info("dropped partial reason=final-pending queue_depth=%d", self.depth)
+                    return False
+                if self._partial is not None:
+                    logger.info("dropped partial reason=partial-queue-full queue_depth=%d", self.depth)
+                    return False
+                self._partial = event
+                self._condition.notify_all()
+                self._log_depth()
+                return True
+            while len(self._finals) >= self.max_pending_finals and not self._closed:
+                await self._condition.wait()
+            if self._closed:
+                raise RuntimeError("decode scheduler closed before final audio was accepted")
+            self._finals.append(event)
+            self._condition.notify_all()
+            self._log_depth()
+            return True
+
+    async def _worker(self) -> None:
+        try:
+            while True:
+                async with self._condition:
+                    while not self._finals and self._partial is None and not self._closed:
+                        await self._condition.wait()
+                    if self._closed and not self._finals and self._partial is None:
+                        return
+                    if self._finals:
+                        event = self._finals.popleft()
+                    else:
+                        event = self._partial
+                        self._partial = None
+                    self._active += 1
+                    self._condition.notify_all()
+                    self._log_depth()
+                assert event is not None
+                try:
+                    await self.process(*event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("decode worker failed kind=%s", event[0])
+                finally:
+                    async with self._condition:
+                        self._active -= 1
+                        self._condition.notify_all()
+                        self._log_depth()
+        except asyncio.CancelledError:
+            return
+
+    async def drain(self) -> None:
+        async with self._condition:
+            while self._active or self._finals or self._partial is not None:
+                await self._condition.wait()
+
+    async def shutdown(self) -> None:
+        async with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        workers = tuple(self._workers)
+        for worker in workers:
+            worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        self._workers.clear()
+
+
+def empty_decode_event(
+    scope: str,
+    audio_seconds: float,
+    metadata: dict[str, Any] | None = None,
+    audio: np.ndarray | None = None,
+    reason: str = "decoder returned no segments",
+) -> dict[str, Any]:
+    """Build the explicit client event used for every empty decode path."""
+    details = metadata or {}
+    values = np.asarray(audio, dtype=np.float32).reshape(-1) if audio is not None and len(audio) else None
+    rms = details.get("rms")
+    peak = details.get("peak")
+    if rms is None:
+        rms = float(np.sqrt(np.mean(values * values))) if values is not None and len(values) else 0.0
+    if peak is None:
+        peak = float(np.abs(values).max()) if values is not None and len(values) else 0.0
+    return {
+        "t": "empty",
+        "scope": scope,
+        "reason": reason,
+        "audio_seconds": float(audio_seconds),
+        "rms": float(rms),
+        "peak": float(peak),
+        "decode_seconds": details.get("decode_seconds"),
+        "rtf": details.get("rtf"),
+        "no_speech_prob": details.get("no_speech_prob"),
+        "avg_logprob": details.get("avg_logprob"),
+    }
 
 
 config = AppConfig.from_sources()
@@ -140,7 +311,7 @@ async def stream(ws: WebSocket) -> None:
     await ws.accept()
     requested_profile = ws.query_params.get("model", DEFAULT_MODEL_PROFILE_ID)
     try:
-        runtime.select_model(requested_profile)
+        await asyncio.to_thread(runtime.select_model, requested_profile)
     except ValueError as exc:
         await ws.send_text(json.dumps({
             "t": "error",
@@ -163,33 +334,76 @@ async def stream(ws: WebSocket) -> None:
     context = ""
     elapsed = 0.0
     source_sample_rate = float(SR)
-    tasks: set[asyncio.Task[Any]] = set()
-    partial_task: asyncio.Task[Any] | None = None
     final_lock = asyncio.Lock()
+    last_note_save_at: float | None = None
+    last_vad_status: dict[str, Any] | None = None
+    sent_first_frame_vad = False
+
+    async def save_note(force: bool = False) -> None:
+        nonlocal last_note_save_at
+        if not session_segments:
+            return
+        now = time.monotonic()
+        interval = float(getattr(config, "note_save_interval_seconds", 20.0))
+        if not force and last_note_save_at is not None and now - last_note_save_at < interval:
+            logger.info(
+                "debounced live note regeneration segment_count=%d next_in=%.1fs",
+                len(session_segments),
+                interval - (now - last_note_save_at),
+            )
+            return
+        note = await asyncio.to_thread(
+            pipeline.create_note,
+            list(session_segments),
+            "Live capture",
+            "live",
+            session_note_id,
+            False,
+        )
+        last_note_save_at = now
+        logger.info("live note save note_id=%s segment_count=%d force=%s", note.id, len(session_segments), force)
+        await ws.send_text(json.dumps({"t": "note", "title": note.title, "id": note.id, "language": note.language}, ensure_ascii=False))
 
     async def process(event_type: str, audio: Any, sid: int, offset: float) -> None:
         nonlocal context
         try:
             final = event_type == "final"
             current_status = runtime.status()
-            await ws.send_text(json.dumps({"t": "model", **current_status, "state": "loading" if current_status["state"] == "not-loaded" else current_status["state"]}))
+            await ws.send_text(json.dumps({
+                "t": "model",
+                **current_status,
+                "state": "loading" if current_status["state"] == "not-loaded" else current_status["state"],
+            }))
             decoded, language = await asyncio.to_thread(runtime.transcribe, audio, final, context, offset)
             await ws.send_text(json.dumps({"t": "model", **runtime.status()}))
             if not decoded:
+                await ws.send_text(json.dumps(empty_decode_event(
+                    event_type,
+                    runtime.last_decode.get("audio_seconds", len(audio) / SR),
+                    runtime.last_decode,
+                    np.asarray(audio, dtype=np.float32),
+                )))
                 return
             text = " ".join(segment.text for segment in decoded)
             if final:
                 async with final_lock:
                     session_segments.extend(decoded)
                     session_segments.sort(key=lambda segment: (segment.start, segment.end, segment.id))
-                    context = " ".join(segment.text for segment in session_segments)[-config.context_chars:]
+                    context = " ".join(segment.text for segment in session_segments)[-200:]
                     for segment in decoded:
                         await ws.send_text(json.dumps({"t": "segment", **segment.to_dict(), "partial": False}, ensure_ascii=False))
-                    note = await asyncio.to_thread(pipeline.create_note, session_segments, "Live capture", "live", session_note_id, False)
-                    await ws.send_text(json.dumps({"t": "note", "title": note.title, "id": note.id, "language": language}))
+                    await save_note()
             else:
-                await ws.send_text(json.dumps({"t": "partial", "id": sid, "start": offset, "end": offset + len(audio) / SR, "text": text, "language": language}, ensure_ascii=False))
+                await ws.send_text(json.dumps({
+                    "t": "partial",
+                    "id": sid,
+                    "start": offset,
+                    "end": offset + len(audio) / SR,
+                    "text": text,
+                    "language": language,
+                }, ensure_ascii=False))
         except Exception as exc:
+            logger.exception("capture processing failed kind=%s", event_type)
             try:
                 await ws.send_text(json.dumps({
                     "t": "error",
@@ -200,16 +414,25 @@ async def stream(ws: WebSocket) -> None:
             except Exception:
                 pass
 
+    scheduler = DecodeScheduler(
+        process,
+        max_inflight=getattr(config, "max_inflight_decodes", 2),
+        max_pending_finals=getattr(config, "max_pending_finals", 8),
+    )
+    await scheduler.start()
     try:
         segmenter = await asyncio.to_thread(Segmenter, config)
-        await ws.send_text(json.dumps({"t": "vad", "state": "ready", "sample_rate": SR, **segmenter.vad_status}))
-        # Warm the Whisper models as soon as capture starts so the user gets
-        # visible progress and the first spoken segment is not the trigger for
-        # an otherwise silent download.
+        last_vad_status = segmenter.vad_status
+        await ws.send_text(json.dumps({"t": "vad", "state": "ready", "sample_rate": SR, **last_vad_status}))
+        # Warm Whisper models as soon as capture starts so download/load progress
+        # and the startup benchmark are visible before speech is detected.
         await ws.send_text(json.dumps({"t": "model", **runtime.status(), "state": "loading"}))
         try:
             await asyncio.to_thread(runtime.ensure_loaded)
-            await ws.send_text(json.dumps({"t": "model", **runtime.status()}))
+            ready_status = runtime.status()
+            await ws.send_text(json.dumps({"t": "model", **ready_status}))
+            if ready_status.get("benchmark"):
+                await ws.send_text(json.dumps({"t": "benchmark", **ready_status["benchmark"]}))
         except Exception as exc:
             await ws.send_text(json.dumps({
                 "t": "error",
@@ -226,13 +449,16 @@ async def stream(ws: WebSocket) -> None:
             if message.get("bytes") is not None:
                 raw_audio = message["bytes"]
                 if not isinstance(raw_audio, (bytes, bytearray)) or not raw_audio or len(raw_audio) % 2:
+                    logger.warning("discarded malformed PCM frame")
                     await ws.send_text(json.dumps({"t": "error", "scope": "audio", "message": "discarded malformed PCM frame"}))
                     continue
                 if len(raw_audio) > 2_000_000:
+                    logger.warning("discarded oversized PCM frame bytes=%d", len(raw_audio))
                     await ws.send_text(json.dumps({"t": "error", "scope": "audio", "message": "discarded oversized PCM frame"}))
                     continue
                 pcm = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
                 if not np.isfinite(pcm).all():
+                    logger.warning("discarded non-finite PCM frame")
                     await ws.send_text(json.dumps({"t": "error", "scope": "audio", "message": "discarded non-finite PCM frame"}))
                     continue
                 pcm = resample_audio(pcm, source_sample_rate, SR)
@@ -240,7 +466,18 @@ async def stream(ws: WebSocket) -> None:
                     continue
                 elapsed += len(pcm) / SR
                 events = await asyncio.to_thread(segmenter.feed, pcm)
-                await ws.send_text(json.dumps({"t": "level", "v": min(1.0, segmenter.level / 0.12), "on": segmenter.seg is not None, "lag": len(tasks), "sample_rate": source_sample_rate}))
+                current_vad_status = segmenter.vad_status
+                if not sent_first_frame_vad or current_vad_status != last_vad_status:
+                    last_vad_status = current_vad_status
+                    sent_first_frame_vad = True
+                    await ws.send_text(json.dumps({"t": "vad", "state": "updated", **current_vad_status}))
+                await ws.send_text(json.dumps({
+                    "t": "level",
+                    "v": min(1.0, segmenter.level / 0.12),
+                    "on": segmenter.seg is not None,
+                    "lag": scheduler.depth,
+                    "sample_rate": source_sample_rate,
+                }))
             elif message.get("text"):
                 try:
                     payload = json.loads(message["text"])
@@ -248,13 +485,17 @@ async def stream(ws: WebSocket) -> None:
                     if event_name == "config":
                         requested_profile = payload.get("model")
                         if requested_profile and requested_profile != runtime.status()["profile_id"]:
-                            if elapsed > 0 or session_segments or any(not task.done() for task in tasks):
+                            if elapsed > 0 or session_segments or scheduler.depth:
                                 await ws.send_text(json.dumps({"t": "error", "scope": "model", "message": "Stop capture before changing the model."}))
                                 continue
                             try:
-                                await ws.send_text(json.dumps({"t": "model", **runtime.select_model(str(requested_profile)), "state": "loading"}))
+                                selected = await asyncio.to_thread(runtime.select_model, str(requested_profile))
+                                await ws.send_text(json.dumps({"t": "model", **selected, "state": "loading"}))
                                 await asyncio.to_thread(runtime.ensure_loaded)
-                                await ws.send_text(json.dumps({"t": "model", **runtime.status()}))
+                                selected = runtime.status()
+                                await ws.send_text(json.dumps({"t": "model", **selected}))
+                                if selected.get("benchmark"):
+                                    await ws.send_text(json.dumps({"t": "benchmark", **selected["benchmark"]}))
                             except Exception as exc:
                                 await ws.send_text(json.dumps({"t": "error", "scope": "model", "message": f"model selection failed: {type(exc).__name__}: {str(exc)[:240]}", "models": runtime.status()}))
                                 continue
@@ -271,20 +512,19 @@ async def stream(ws: WebSocket) -> None:
                     await ws.send_text(json.dumps({"t": "error", "scope": "stream", "message": "ignored malformed control message"}))
                     continue
             for event_type, audio, sid in events:
-                # Large-v3 is intentionally accuracy-first and can be slower
-                # than real time on CPU. Never let stale partials pile up and
-                # delay a final utterance; the final transcript always wins.
-                if event_type == "partial" and partial_task is not None and not partial_task.done():
-                    continue
-                task = asyncio.create_task(process(event_type, audio, sid, max(0.0, elapsed - len(audio) / SR)))
-                tasks.add(task)
-                if event_type == "partial":
-                    partial_task = task
-                task.add_done_callback(tasks.discard)
+                await scheduler.submit(event_type, audio, sid, max(0.0, elapsed - len(audio) / SR))
             if flush_requested:
-                pending = tuple(tasks)
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
+                await scheduler.drain()
+                if session_segments:
+                    # Always run one complete extraction pass on flush, even if
+                    # the last debounced save happened moments earlier.
+                    await save_note(force=True)
+                else:
+                    await ws.send_text(json.dumps(empty_decode_event(
+                        "flush",
+                        elapsed,
+                        reason="no speech segment was captured",
+                    )))
                 await ws.send_text(json.dumps({
                     "t": "flushed",
                     "saved": bool(session_segments),
@@ -303,5 +543,4 @@ async def stream(ws: WebSocket) -> None:
         except Exception:
             pass
     finally:
-        for task in tasks:
-            task.cancel()
+        await scheduler.shutdown()

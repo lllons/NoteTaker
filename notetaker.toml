@@ -1,20 +1,22 @@
 [notetaker]
-# The web selector starts at the official large-v3 checkpoint and includes
-# additional public faster-whisper CTranslate2 models from Hugging Face.
+# Live capture defaults to the practical large-v3 Turbo CPU checkpoint.
+# large-v3 remains available in the selector as an offline/slower-than-real-time choice.
 # faster-whisper choices load on CPU with int8 weights. The three larger
 # Transformers choices use CPU float32 and are installed from the optional
 # requirements-large-models.txt file.
-model = "large-v3"
-# Reuse the same loaded model for partials so CPU memory is not doubled.
-draft_model = "large-v3"
+model = "large-v3-turbo"
+# Partials always use their own small model so draft work cannot block finals.
+draft_model = "tiny.en"
 language = "auto"
-beam_size = 8
+beam_size = 2
 threads = 0
 # Comma-separated names, jargon, code terms, or product names for Whisper prompting.
 hotwords = ""
 data_dir = "data"
-context_chars = 1200
-max_segment_seconds = 30
+context_chars = 200
+use_context_prompt = false
+max_segment_seconds = 14
+soft_max_seconds = 8
 min_segment_seconds = 0.15
 # Recall-first listening boundaries: keep quiet starts, pauses, and trailing words.
 vad_on_threshold = 0.35
@@ -22,6 +24,10 @@ vad_off_threshold = 0.20
 preroll_seconds = 1.0
 end_silence_seconds = 1.4
 partial_seconds = 4.0
+note_save_interval_seconds = 20.0
+max_inflight_decodes = 2
+max_pending_finals = 8
+benchmark_seconds = 5.0
 provider_timeout = 45
 # labels-only preserves speaker fields without pretending heuristic labels are diarization.
 diarization = "labels-only"
